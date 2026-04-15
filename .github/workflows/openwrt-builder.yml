@@ -116,14 +116,42 @@ jobs:
         run: |
           cd openwrt
 
-          # 追加 kiddin9 一站式软件源（含 turboacc、dockerman 等）
+          # ── 追加 kiddin9 源（仅当不存在时）─────────────────────
           grep -qF "kiddin9" feeds.conf.default \
-            || echo "src-git kiddin9 https://github.com/kiddin9/openwrt-packages.git" \
+            || echo "src-git kiddin9 https://github.com/kiddin9/openwrt-packages.git;master" \
               >> feeds.conf.default
 
-          ./scripts/feeds update -a
+          # ── 先更新官方 feeds（必须成功）─────────────────────────
+          ./scripts/feeds update packages luci routing telephony
+
+          # ── 单独更新 kiddin9（失败只警告，不退出）───────────────
+          echo "📥 更新 kiddin9 feed..."
+          if ./scripts/feeds update kiddin9; then
+            echo "✅ kiddin9 更新成功"
+            KIDDIN9_OK=1
+          else
+            echo "⚠️ kiddin9 更新失败，将跳过该 feed"
+            # 从 feeds.conf.default 移除，避免后续 install -a 报错
+            sed -i '/kiddin9/d' feeds.conf.default
+            KIDDIN9_OK=0
+          fi
+
+          # ── 安装所有已成功的 feeds ───────────────────────────────
           ./scripts/feeds install -a
           ./scripts/feeds install ucode-mod-digest || true
+
+          # ── 若 kiddin9 成功，单独安装需要的包 ────────────────────
+          if [ "$KIDDIN9_OK" = "1" ]; then
+            ./scripts/feeds install luci-app-turboacc || true
+            ./scripts/feeds install luci-app-dockerman || true
+            echo "✅ kiddin9 插件安装完成"
+          else
+            echo "⚠️ kiddin9 不可用，turboacc/dockerman 将缺失"
+            # 从 .config 移除依赖 kiddin9 的包，避免编译报错
+            sed -i '/turboacc/d' .config 2>/dev/null || true
+            sed -i '/dockerman/d' .config 2>/dev/null || true
+          fi
+
           echo "=== 可用目标验证 ==="
           ls target/linux/ | grep -i qualcommax \
             && echo "✅ qualcommax target 存在" \
