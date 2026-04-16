@@ -1,0 +1,10 @@
+#!/bin/sh /etc/rc.common
+# files/etc/init.d/bbr-load
+START=11   # 比 network(10) 晚一步，比 sysctl(12) 早一步
+
+start() {
+  modprobe tcp_bbr 2>/dev/null || true
+  # 手动补写，保证 ip_forward 一定生效
+  echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+  sysctl -p /etc/sysctl.d/99-bbr.conf 2>/dev/null || true
+}
