@@ -244,9 +244,10 @@ jobs:
             # ── 网络加速：TurboAcc ────────────────────────────────
             echo "CONFIG_PACKAGE_luci-app-turboacc=y"
             echo "CONFIG_PACKAGE_luci-i18n-turboacc-zh-cn=y"
-            echo "# CONFIG_PACKAGE_kmod-fast-classifier is not set"
-            echo "# CONFIG_PACKAGE_kmod-shortcut-fe is not set"
-            echo "# CONFIG_PACKAGE_kmod-shortcut-fe-drv is not set"
+            # TurboAcc 依赖（按需启用，offload 与 nftables 共存）
+            echo "CONFIG_PACKAGE_kmod-fast-classifier=y"
+            echo "CONFIG_PACKAGE_kmod-shortcut-fe=y"
+            echo "CONFIG_PACKAGE_kmod-shortcut-fe-drv=y"
 
             # ── 内网穿透：Lucky ───────────────────────────────────
             echo "CONFIG_PACKAGE_luci-app-lucky=y"
@@ -266,12 +267,12 @@ jobs:
             echo "CONFIG_PACKAGE_kmod-veth=y"
             echo "CONFIG_PACKAGE_kmod-br-netfilter=y"
             echo "CONFIG_PACKAGE_kmod-nft-bridge=y"
+            echo "CONFIG_PACKAGE_kmod-ipt-extra=y"
+            echo "CONFIG_PACKAGE_kmod-ipt-physdev=y"
             echo "CONFIG_PACKAGE_kmod-lib-crc32c=y"
             echo "CONFIG_PACKAGE_kmod-crypto-crc32c=y"
             echo "CONFIG_PACKAGE_kmod-dm=y"
             echo "CONFIG_PACKAGE_kmod-overlay=y"
-            echo "# CONFIG_PACKAGE_kmod-ipt-extra is not set"
-            echo "# CONFIG_PACKAGE_kmod-ipt-physdev is not set"
 
             # ── 性能优化 ──────────────────────────────────────────
             echo "CONFIG_PACKAGE_kmod-tcp-bbr=y"
