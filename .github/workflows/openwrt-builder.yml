@@ -256,6 +256,9 @@ jobs:
             "CONFIG_PACKAGE_lsblk=y" \
             >> .config
 
+          # 强制禁用 ddwrt 版本，避免文件冲突
+          echo "# CONFIG_PACKAGE_ath11k-firmware-ipq6018-ddwrt is not set" >> .config
+          
           make defconfig 2>&1 | tail -3
 
           echo "=== 最终 .config 验证 ==="
