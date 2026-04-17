@@ -116,111 +116,21 @@ jobs:
       - name: 📁 同步自定义配置文件
         run: |
           set -euo pipefail
-
           mkdir -p openwrt/files/etc/uci-defaults
 
+          # 直接从仓库 files/ 目录同步，不在 workflow 里重复生成脚本
           if [ -d files ]; then
             cp -rf files/. openwrt/files/
             echo "✅ 自定义配置已就绪"
           else
-            echo "⚠️ 仓库中无 files/ 目录，仅使用自动生成的 uci-defaults"
+            echo "❌ 仓库中无 files/ 目录，请确认文件结构"
+            exit 1
           fi
 
-          # 使用 printf 逐行写入脚本（不使用 heredoc）
-          printf '%s\n' \
-            '#!/bin/sh' \
-            'LOG="/tmp/firstboot-network.log"' \
-            'exec >> "$LOG" 2>&1' \
-            'echo "=== firstboot network setup: $(date) ==="' \
-            '' \
-            'READY=false' \
-            'for i in $(seq 1 15); do' \
-            '    if ip link show eth0 >/dev/null 2>&1 || ip link show lan1 >/dev/null 2>&1; then' \
-            '        READY=true' \
-            '        break' \
-            '    fi' \
-            '    sleep 1' \
-            'done' \
-            '[ "$READY" = "false" ] && echo "Warning: network interfaces not ready after 15s"' \
-            '' \
-            'detect_iface_style() {' \
-            '    if ip link show eth0 >/dev/null 2>&1; then' \
-            '        echo "eth"' \
-            '    else' \
-            '        echo "dsa"' \
-            '    fi' \
-            '}' \
-            '' \
-            'STYLE=$(detect_iface_style)' \
-            'echo "Interface style detected: $STYLE"' \
-            '' \
-            'if [ "$STYLE" = "eth" ]; then' \
-            '    LAN_PORTS="eth0 eth1 eth2 eth3"' \
-            '    WAN_IFACE="eth4"' \
-            'else' \
-            '    LAN_PORTS="lan1 lan2 lan3 lan4"' \
-            '    WAN_IFACE="wan"' \
-            'fi' \
-            '' \
-            'echo "LAN ports: $LAN_PORTS"' \
-            'echo "WAN iface: $WAN_IFACE"' \
-            '' \
-            'uci -q batch << BATCH_EOF' \
-            'delete network.lan_dev' \
-            'set network.lan_dev=device' \
-            'set network.lan_dev.name=br-lan' \
-            'set network.lan_dev.type=bridge' \
-            'set network.lan=interface' \
-            'set network.lan.device=br-lan' \
-            'set network.lan.proto=static' \
-            'set network.lan.ipaddr=192.168.1.1' \
-            'set network.lan.netmask=255.255.255.0' \
-            'set network.lan.ip6assign=60' \
-            'set network.wan=interface' \
-            'set network.wan.device=${WAN_IFACE}' \
-            'set network.wan.proto=dhcp' \
-            'set network.wan6=interface' \
-            'set network.wan6.device=${WAN_IFACE}' \
-            'set network.wan6.proto=dhcpv6' \
-            'BATCH_EOF' \
-            '' \
-            'for p in $LAN_PORTS; do' \
-            '    ip link show "$p" >/dev/null 2>&1 \' \
-            '        && uci add_list network.lan_dev.ports="$p" \' \
-            '        || echo "Warning: interface $p not found, skipping"' \
-            'done' \
-            '' \
-            'uci commit network || { echo "Error: uci commit network failed"; exit 1; }' \
-            '' \
-            'WZ=""' \
-            'i=0' \
-            'while uci -q get "firewall.@zone[$i]" > /dev/null 2>&1; do' \
-            '    [ "$(uci -q get "firewall.@zone[$i].name")" = "wan" ] && WZ=$i && break' \
-            '    i=$((i+1))' \
-            'done' \
-            '' \
-            'if [ -n "$WZ" ]; then' \
-            '    uci -q del_list "firewall.@zone[${WZ}].network=wan6" 2>/dev/null || true' \
-            '    uci -q del_list "firewall.@zone[${WZ}].network=wan"  2>/dev/null || true' \
-            '    uci add_list "firewall.@zone[${WZ}].network=wan"' \
-            '    uci add_list "firewall.@zone[${WZ}].network=wan6"' \
-            '    uci commit firewall || echo "Warning: uci commit firewall failed"' \
-            '    echo "Firewall wan zone updated (index $WZ)"' \
-            'fi' \
-            '' \
-            'uci -q batch << BATCH2_EOF' \
-            'set system.@system[0].hostname=OpenWrt-360V6' \
-            'set system.@system[0].timezone=CST-8' \
-            'set system.@system[0].zonename=Asia/Shanghai' \
-            'BATCH2_EOF' \
-            'uci commit system' \
-            '' \
-            'echo "=== firstboot network setup done ==="' \
-            'exit 0' \
-            > openwrt/files/etc/uci-defaults/99-firstboot-setup.sh
-
+          # 确保 uci-defaults 脚本有执行权限
           chmod 755 openwrt/files/etc/uci-defaults/99-firstboot-setup.sh
-          echo "✅ uci-defaults/99-firstboot-setup.sh 已写入"
+          chmod 755 openwrt/files/etc/init.d/bbr-load
+          echo "✅ 文件权限已设置"
 
       - name: ⚙️ 生成 .config
         run: |
@@ -307,10 +217,11 @@ jobs:
             "CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y" \
             "CONFIG_PACKAGE_kmod-veth=y" \
             "CONFIG_PACKAGE_kmod-br-netfilter=y" \
-            "CONFIG_PACKAGE_kmod-lib-crc32c=y" \
-            "CONFIG_PACKAGE_kmod-crypto-crc32c=y" \
             "CONFIG_PACKAGE_kmod-dm=y" \
             "CONFIG_PACKAGE_kmod-overlay=y" \
+            "CONFIG_PACKAGE_kmod-netlink-diag=y" \
+            "CONFIG_PACKAGE_kmod-ip-set=y" \
+            "CONFIG_PACKAGE_kmod-nft-core=y" \
             "" \
             "# 性能" \
             "CONFIG_PACKAGE_kmod-tcp-bbr=y" \
@@ -463,10 +374,15 @@ jobs:
             - 在线升级：`squashfs-sysupgrade.bin`
             - 救砖测试：`initramfs-uImage.itb`
 
-            ### 已修复
+            ### 包含功能
             - ✅ DSA 接口命名自适应（兼容新/旧内核）
-            - ✅ ath11k 无线固件使用正确包名 `ipq6018`
-            - ✅ uci-defaults 首次启动网络配置
+            - ✅ ath11k 无线固件（ipq6018）
+            - ✅ homeproxy + sing-box 代理
+            - ✅ AdGuardHome 广告过滤
+            - ✅ Docker 容器支持
+            - ✅ Lucky 内网穿透
+            - ✅ BBR 拥塞控制 + TCP 调优
+            - ✅ USB 存储支持
           draft: false
           prerelease: false
         env:
