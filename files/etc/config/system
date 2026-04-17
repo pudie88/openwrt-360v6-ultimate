@@ -1,7 +1,7 @@
 # files/etc/config/system
 
 config system
-    option hostname 'OpenWrt'
+    option hostname 'OpenWrt-360V6'
     option timezone 'CST-8'
     option zonename 'Asia/Shanghai'
     option ttylogin '0'
