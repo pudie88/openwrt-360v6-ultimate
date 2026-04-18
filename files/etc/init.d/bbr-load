@@ -1,16 +1,11 @@
 #!/bin/sh /etc/rc.common
-# files/etc/init.d/bbr-load
-# 加载 BBR 并应用 sysctl 参数
-# START=15：在 network(10)、boot(10) 之后，保证内核模块已就位
+# 加载 BBR 拥塞控制并应用 sysctl 参数
 START=15
 STOP=89
 
 start() {
-    # 加载 BBR 内核模块
     modprobe tcp_bbr 2>/dev/null || true
-    # 确保 ip_forward 生效（Docker/homeproxy 必需）
     echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
-    # 应用全部 sysctl 调优参数
     sysctl -p /etc/sysctl.d/99-bbr.conf 2>/dev/null || true
     logger -t bbr-load "BBR loaded, sysctl applied"
 }
