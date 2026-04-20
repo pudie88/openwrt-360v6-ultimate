@@ -1,0 +1,62 @@
+#!/bin/sh
+# 96-install-docker
+# 在后台安装和启动 docker，不阻塞系统启动
+
+LOG_TAG="install-docker"
+DONE_FLAG="/etc/docker-install-done"
+LOG_FILE="/var/log/docker-install.log"
+
+# 已完成则跳过
+[ -f "$DONE_FLAG" ] && exit 0
+
+# 后台执行安装和启动
+nohup sh -c '
+log() {
+    echo "[$(date "+%H:%M:%S")] $1" | tee -a "$LOG_FILE" | logger -t "$LOG_TAG"
+}
+
+log "开始 Docker 安装流程..."
+
+# 等待网络就绪（最多5分钟）
+log "等待网络连接..."
+for i in $(seq 1 150); do
+    ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 && break
+    sleep 2
+done
+
+# 更新 apk 索引
+log "更新软件包索引..."
+apk update >/dev/null 2>&1 || true
+
+# 安装 docker 包组
+log "安装 Docker 组件..."
+if apk add --no-cache dockerd docker docker-compose cgroupfs-mount 2>&1 | tee -a "$LOG_FILE"; then
+    log "✅ Docker 组件安装成功"
+else
+    log "⚠️  Docker 组件安装失败"
+    exit 1
+fi
+
+# 挂载 cgroup2
+mount | grep -q cgroup2 || mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
+
+# 启动 docker 服务
+log "启动 Docker 服务..."
+service dockerd enable >/dev/null 2>&1
+if service dockerd start 2>&1 | tee -a "$LOG_FILE"; then
+    sleep 5
+    if service dockerd status 2>&1 | grep -q running; then
+        log "✅ Docker 服务启动成功"
+    else
+        log "⚠️  Docker 服务未运行"
+    fi
+else
+    log "❌ Docker 服务启动失败"
+fi
+
+# 创建完成标记
+touch "$DONE_FLAG"
+log "Docker 安装流程完成"
+' > "$LOG_FILE" 2>&1 &
+
+exit 0
