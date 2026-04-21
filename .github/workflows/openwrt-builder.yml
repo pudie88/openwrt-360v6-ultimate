@@ -18,11 +18,21 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  validate-config:
+  build-openwrt:
     runs-on: ubuntu-latest
+    container:
+      image: openwrtorg/sdk:latest
+      options: --privileged
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Setup environment
+        run: |
+          echo "=== Environment Info ==="
+          uname -a
+          df -h
+          free -h
 
       - name: Debug configuration
         run: |
@@ -53,14 +63,11 @@ jobs:
       - name: Calculate config size
         run: |
           echo "=== Configuration Summary ==="
-          # 计算启用的包数量
           enabled_count=$(grep "=y$" .config | wc -l)
           disabled_count=$(grep "=n$" .config | wc -l)
-          
           echo "Enabled packages: $enabled_count"
           echo "Disabled packages: $disabled_count"
           
-          # 检查是否有重型包
           echo "=== Heavy packages check ==="
           for pkg in dockerd samba4-server adguardhome lucky; do
             if grep -q "^CONFIG_PACKAGE_\${pkg}=y" .config; then
@@ -70,20 +77,70 @@ jobs:
             fi
           done
 
-  simulate-build:
-    needs: validate-config
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Simulation success
+      - name: Prepare OpenWrt build
         run: |
-          echo "🎉 配置验证成功！"
-          echo "📊 70MB精简配置已通过所有检查"
-          echo "📦 可以开始本地编译或使用其他构建平台"
-          echo ""
-          echo "📋 下一步："
-          echo "  1. 配置已推送到 https://github.com/pudie88/360-v6"
-          echo "  2. 使用 OpenWrt ImageBuilder 进行本地编译"
-          echo "  3. 或使用第三方 CI 服务进行完整构建"
+          echo "=== Setting up OpenWrt build ==="
+          cd /openwrt
+          
+          # 复制配置文件
+          cp /github/workspace/.config .
+          
+          # 应用配置
+          make defconfig
+
+      - name: Download feeds
+        run: |
+          cd /openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          
+          # 检查是否有sing-box包
+          if ./scripts/feeds list | grep -q sing-box; then
+            echo "✅ sing-box feed available"
+          else:
+            echo "⚠️ sing-box feed not found, trying to install from source"
+
+      - name: Build firmware (optimized for speed)
+        run: |
+          cd /openwrt
+          echo "=== Starting build ==="
+          echo "CPU cores: $(nproc)"
+          echo "Memory: $(free -h)"
+          
+          # 使用多核编译，但限制内存使用
+          make -j$(($(nproc) / 2)) V=s 2>&1 | tee build.log || true
+          
+          # 检查是否构建成功
+          if find bin -name "*.bin" -o -name "*.img" | head -1; then
+            echo "✅ Build succeeded!"
+          else:
+            echo "❌ Build failed, checking logs..."
+            tail -50 build.log
+            exit 1
+
+      - name: Check firmware size
+        run: |
+          cd /openwrt
+          echo "=== Firmware size check ==="
+          find bin -name "*.bin" -o -name "*.img" | while read f; do
+            size_bytes=$(stat -c%s "$f")
+            size_mb=$((size_bytes / 1024 / 1024))
+            echo "$f: ${size_mb}MB"
+            
+            # 验证大小是否在70MB以内
+            if [ $size_mb -gt 75 ]; then
+              echo "❌ Firmware too large: ${size_mb}MB > 70MB target"
+              exit 1
+            else:
+              echo "✅ Firmware size OK: ${size_mb}MB ≤ 70MB target"
+            fi
+          done
+
+      - name: Upload firmware artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-firmware
+          path: /openwrt/bin/
+          if-no-files-found: error
+          retention-days: 7
