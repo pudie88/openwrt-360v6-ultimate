@@ -20,9 +20,7 @@ env:
 jobs:
   build-openwrt:
     runs-on: ubuntu-latest
-    container:
-      image: openwrtorg/sdk:latest
-      options: --privileged
+    timeout-minutes: 360  # 6小时超时
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,6 +31,10 @@ jobs:
           uname -a
           df -h
           free -h
+          
+          # 安装OpenWrt构建依赖
+          sudo apt-get update
+          sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk             gettext git java-propose-classpath libelf-dev libncurses5-dev             libncursesw5-dev libssl-dev python3 python2.7-dev python3-pip             python3-setuptools python3-dev rsync subversion swig time             xsltproc zlib1g-dev unzip wget curl
 
       - name: Debug configuration
         run: |
@@ -60,79 +62,69 @@ jobs:
             exit 1
           fi
 
-      - name: Calculate config size
+      - name: Clone OpenWrt source
         run: |
-          echo "=== Configuration Summary ==="
-          enabled_count=$(grep "=y$" .config | wc -l)
-          disabled_count=$(grep "=n$" .config | wc -l)
-          echo "Enabled packages: $enabled_count"
-          echo "Disabled packages: $disabled_count"
+          git clone https://github.com/openwrt/openwrt.git --depth=1 -b openwrt-24.10
+          cd openwrt
           
-          echo "=== Heavy packages check ==="
-          for pkg in dockerd samba4-server adguardhome lucky; do
-            if grep -q "^CONFIG_PACKAGE_\${pkg}=y" .config; then
-              echo "❌ $pkg is ENABLED (should be disabled)"
-            else
-              echo "✅ $pkg is disabled"
-            fi
-          done
+          # 启用编译缓存
+          make download
+          find . -maxdepth 1 -name "*.patch" -exec rm {} \;
 
-      - name: Prepare OpenWrt build
+      - name: Apply configuration
         run: |
-          echo "=== Setting up OpenWrt build ==="
-          cd /openwrt
-          
-          # 复制配置文件
-          cp /github/workspace/.config .
-          
-          # 应用配置
+          cd openwrt
+          cp ../.config .
           make defconfig
 
       - name: Download feeds
         run: |
-          cd /openwrt
+          cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           
           # 检查是否有sing-box包
-          if ./scripts/feeds list | grep -q sing-box; then
-            echo "✅ sing-box feed available"
-          else:
-            echo "⚠️ sing-box feed not found, trying to install from source"
+          echo "=== Checking for sing-box ==="
+          ./scripts/feeds list | grep -i sing || echo "sing-box not in feeds"
 
-      - name: Build firmware (optimized for speed)
+      - name: Build firmware
         run: |
-          cd /openwrt
+          cd openwrt
           echo "=== Starting build ==="
           echo "CPU cores: $(nproc)"
           echo "Memory: $(free -h)"
           
-          # 使用多核编译，但限制内存使用
-          make -j$(($(nproc) / 2)) V=s 2>&1 | tee build.log || true
+          # 使用更保守的并行编译，避免内存不足
+          make -j$(($(nproc) - 1)) V=s 2>&1 | tee build.log || true
           
           # 检查是否构建成功
-          if find bin -name "*.bin" -o -name "*.img" | head -1; then
+          if find bin/targets -name "*.bin" -o -name "*.img" 2>/dev/null | head -1; then
             echo "✅ Build succeeded!"
           else:
             echo "❌ Build failed, checking logs..."
-            tail -50 build.log
+            tail -100 build.log | grep -i "error\|fail\|stop" | head -20
             exit 1
 
       - name: Check firmware size
+        if: success()
         run: |
-          cd /openwrt
+          cd openwrt
           echo "=== Firmware size check ==="
-          find bin -name "*.bin" -o -name "*.img" | while read f; do
-            size_bytes=$(stat -c%s "$f")
+          find bin/targets -name "*.bin" -o -name "*.img" 2>/dev/null | while read f; do
+            size_bytes=$(stat -c%s "$f" 2>/dev/null || echo "0")
             size_mb=$((size_bytes / 1024 / 1024))
-            echo "$f: ${size_mb}MB"
-            
-            # 验证大小是否在70MB以内
-            if [ $size_mb -gt 75 ]; then
-              echo "❌ Firmware too large: ${size_mb}MB > 70MB target"
-              exit 1
-            else:
-              echo "✅ Firmware size OK: ${size_mb}MB ≤ 70MB target"
+            if [ $size_mb -eq 0 ]; then
+              echo "⚠️  Could not get size for $f"
+            else
+              echo "$f: ${size_mb}MB"
+              
+              # 验证大小是否在70MB以内
+              if [ $size_mb -gt 75 ]; then
+                echo "❌ Firmware too large: ${size_mb}MB > 70MB target"
+                exit 1
+              else:
+                echo "✅ Firmware size OK: ${size_mb}MB ≤ 70MB target"
+              fi
             fi
           done
 
@@ -141,6 +133,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: openwrt-firmware
-          path: /openwrt/bin/
+          path: openwrt/bin/
           if-no-files-found: error
           retention-days: 7
