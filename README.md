@@ -169,6 +169,3 @@ rm -f /etc/install-extras-done
 | 最小 U 盘容量 | 1GB（推荐 ≥8GB） |
 
 ---
-
-
-需要我调整或补充任何内容吗？
