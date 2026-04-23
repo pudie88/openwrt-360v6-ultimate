@@ -1,6 +1,3 @@
-好的，以下是针对你的 `96-install-extras` 脚本和编译配置的完整 README：
-
-```markdown
 # 360 V6 - 自动 U 盘 Overlay 扩容 + 一键安装脚本
 
 ## 功能概述
@@ -38,71 +35,6 @@
 
 ---
 
-## 编译配置
-
-### 1. 依赖包（必须勾选）
-
-在 `make menuconfig` 中确保勾选以下依赖：
-
-```bash
-# USB 支持
-CONFIG_PACKAGE_kmod-usb-storage=y
-CONFIG_PACKAGE_kmod-fs-ext4=y
-
-# fstab 支持
-CONFIG_PACKAGE_block-mount=y
-CONFIG_PACKAGE_automount=y
-
-# 格式化工具（必须！脚本依赖）
-CONFIG_PACKAGE_e2fsprogs=y          # mkfs.ext4, blkid, tune2fs
-```
-
-### 2. 完整 .config 片段
-
-将以下内容添加到你的 `.config` 文件：
-
-```bash
-# ========== USB 支持 ==========
-CONFIG_PACKAGE_kmod-usb-dwc3=y
-CONFIG_PACKAGE_kmod-usb-storage=y
-CONFIG_PACKAGE_kmod-usb-storage-uas=y
-CONFIG_PACKAGE_kmod-fs-ext4=y
-CONFIG_PACKAGE_kmod-fs-ntfs3=y
-CONFIG_PACKAGE_block-mount=y
-CONFIG_PACKAGE_automount=y
-CONFIG_PACKAGE_luci-app-diskman=y
-CONFIG_PACKAGE_luci-i18n-diskman-zh-cn=y
-
-# ========== 安装脚本依赖（只需这一个！）==========
-CONFIG_PACKAGE_e2fsprogs=y
-
-# ========== Docker 内核模块（必须内置）==========
-CONFIG_PACKAGE_kmod-veth=y
-CONFIG_PACKAGE_kmod-br-netfilter=y
-CONFIG_PACKAGE_kmod-nft-bridge=y
-CONFIG_PACKAGE_kmod-dummy=y
-CONFIG_PACKAGE_kmod-nf-conntrack=y
-CONFIG_PACKAGE_kmod-nf-nat=y
-CONFIG_PACKAGE_kmod-ipt-nat=y
-CONFIG_PACKAGE_kmod-ipt-physdev=y
-```
-
-### 3. 放置脚本文件
-
-在代码仓库中创建以下目录结构：
-
-```
-你的仓库/
-└── files/
-    └── etc/
-        └── hotplug.d/
-            └── iface/
-                └── 99-install-extras    # 脚本文件
-```
-
-脚本内容见：[96-install-extras](#)
-
----
 
 ## 使用说明
 
