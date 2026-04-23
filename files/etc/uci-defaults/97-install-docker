@@ -1,0 +1,5 @@
+#!/bin/sh
+# 97-install-docker
+# Docker 安装已整合到 96-install-extras 的 procd init 服务中
+# 此脚本保留为空操作
+exit 0
