@@ -1,0 +1,306 @@
+name: Build OpenWrt for 360 V6
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/openwrt-builder.yml'
+      - '.config'
+      - 'files/**'
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: master
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 480
+    permissions:
+      contents: write
+
+    steps:
+      - name: 📦 Checkout Code
+        uses: actions/checkout@v4
+
+      # ── 缓存识别：打印当前 .config 的 hash，确认编译内容 ──────────
+      - name: 🔍 Config Hash（用于确认是否使用了最新配置）
+        run: |
+          echo "=== .config SHA256 ==="
+          sha256sum .config
+          echo "=== .config 前 30 行 ==="
+          head -30 .config
+          echo "=== 关键标志位确认 ==="
+          grep -E "apk-openssl|apk-mbedtls|homeproxy|sing-box|DEVICE_qihoo" .config || true
+
+      - name: 🗑️ Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/share/swift /usr/local/.ghcup /usr/lib/jvm
+          sudo docker rmi $(docker images -q) 2>/dev/null || true
+          sudo apt-get autoremove -y --purge && sudo apt-get clean
+          sudo swapoff -a && sudo rm -f /swapfile /mnt/swapfile
+          df -h
+
+      - name: 🛠️ Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git \
+            libncurses5-dev libssl-dev python3 python3-pip \
+            rsync swig unzip zlib1g-dev wget curl ca-certificates file
+
+      - name: 📥 Clone Source
+        run: |
+          git clone --depth 1 -b $REPO_BRANCH $REPO_URL openwrt
+          cd openwrt
+          echo "OPENWRT_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date '+%Y-%m-%d %H:%M')" >> $GITHUB_ENV
+
+      - name: 📦 Install Custom Packages
+        run: |
+          cd openwrt
+
+          rm -rf package/luci-theme-argon
+          git clone --depth 1 https://github.com/jerrykuku/luci-theme-argon.git \
+            package/luci-theme-argon
+          echo "✅ luci-theme-argon 克隆完成"
+
+          rm -rf package/homeproxy
+          git clone --depth 1 https://github.com/immortalwrt/homeproxy.git \
+            package/homeproxy
+          echo "✅ homeproxy 克隆完成"
+
+      - name: 🔄 Update & Install Feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: ⚙️ Apply Config
+        run: |
+          cd openwrt
+
+          # ── 移除 sing-box-tiny 冲突 ─────────────────────────────────
+          SINGBOX_MK="feeds/packages/net/sing-box/Makefile"
+          if [ -f "$SINGBOX_MK" ]; then
+            sed -i '/define Package\/sing-box-tiny/,/^endef/d' "$SINGBOX_MK"
+            sed -i '/BuildPackage,sing-box-tiny/d' "$SINGBOX_MK"
+            echo "✅ sing-box-tiny 冲突已移除"
+          fi
+
+          # ── 只编译 360v6 ─────────────────────────────────────────────
+          MK="target/linux/qualcommax/image/ipq60xx.mk"
+          sed -i '/^TARGET_DEVICES +=/d' "$MK"
+          echo 'TARGET_DEVICES += qihoo_360v6' >> "$MK"
+          echo "=== TARGET_DEVICES ==="
+          grep "TARGET_DEVICES" "$MK"
+
+          # ── 应用配置 ─────────────────────────────────────────────────
+          cp "${GITHUB_WORKSPACE}/.config" .config
+
+          # 清理可能残留的旧配置行
+          sed -i '/CONFIG_TARGET_.*DEVICE.*/d' .config
+          sed -i '/CONFIG_TARGET_ROOTFS_PARTSIZE/d' .config
+          sed -i '/CONFIG_PACKAGE_kmod-sfe=/d' .config
+          sed -i '/CONFIG_PACKAGE_kmod-fast-classifier=/d' .config
+          sed -i '/CONFIG_PACKAGE_kmod-ip6tables=/d' .config
+          # 强制替换 apk-mbedtls 为 apk-openssl（防止旧配置残留）
+          sed -i 's/^CONFIG_PACKAGE_apk-mbedtls=y/# CONFIG_PACKAGE_apk-mbedtls is not set/' .config
+          sed -i '/^# CONFIG_PACKAGE_apk-openssl/d' .config
+
+          # 写入设备锁定
+          sed -i '1s/^/CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qihoo_360v6=y\n/' .config
+
+          # ── defconfig 展开 ───────────────────────────────────────────
+          make defconfig 2>&1 | tail -5
+
+          # ── 关键项校验 ───────────────────────────────────────────────
+          FAIL=0
+
+          grep -q "^CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qihoo_360v6=y" .config \
+            && echo "✅ 设备锁定：qihoo_360v6" \
+            || { echo "❌ 设备锁定失败"; FAIL=1; }
+
+          # apk-openssl 是编译时决定的，defconfig 展开后可能以不同 key 体现
+          # 只要 apk-mbedtls 没有被启用就是安全的
+          if grep -q "^CONFIG_PACKAGE_apk-mbedtls=y" .config; then
+            echo "❌ apk-mbedtls 仍被启用，apk update 将失败"
+            FAIL=1
+          else
+            echo "✅ apk-mbedtls 未启用"
+          fi
+
+          grep -Eq "^CONFIG_PACKAGE_ath11k-firmware-ipq60xx.*=y" .config \
+            && echo "✅ ath11k-firmware-ipq60xx 已启用" \
+            || echo "⚠️  ath11k 固件未显式启用（由 defconfig 处理）"
+
+          if grep -q "^CONFIG_PACKAGE_kmod-sfe=y" .config \
+          || grep -q "^CONFIG_PACKAGE_kmod-fast-classifier=y" .config; then
+            echo "❌ SFE 被启用，将导致 LAN 无法获取 IP"
+            FAIL=1
+          else
+            echo "✅ SFE 已禁用"
+          fi
+
+          grep -q "^CONFIG_PACKAGE_sing-box=y" .config \
+            && echo "✅ sing-box 已编译内置" \
+            || echo "⚠️  sing-box 未找到（检查 sing-box-tiny 冲突是否清理）"
+
+          grep -q "^CONFIG_PACKAGE_luci-app-homeproxy=y" .config \
+            && echo "✅ homeproxy 已编译内置" \
+            || echo "⚠️  homeproxy 未找到"
+
+          [ $FAIL -eq 0 ] || exit 1
+
+          # ── 复制预置文件 ─────────────────────────────────────────────
+          mkdir -p files/etc/uci-defaults files/etc/sysctl.d
+          for f in 99-custom-ip 98-fix-apk-feeds 97-install-docker 96-install-extras; do
+            cp "${GITHUB_WORKSPACE}/files/etc/uci-defaults/$f" \
+               "files/etc/uci-defaults/$f"
+            chmod +x "files/etc/uci-defaults/$f"
+          done
+          cp "${GITHUB_WORKSPACE}/files/etc/sysctl.d/99-bbr.conf" \
+             files/etc/sysctl.d/99-bbr.conf
+
+          # ── 打印关键配置确认 ─────────────────────────────────────────
+          echo "=== 已启用的关键包 ==="
+          grep "^CONFIG_PACKAGE_.*=y" .config | grep -E \
+            "apk|homeproxy|sing.box|ath11k|dnsmasq|firewall|smartdns|docker|sfe" \
+            | sort
+          echo "=== files/ 预置内容 ==="
+          find files -type f | sort
+
+      - name: ⬇️ Download Packages
+        run: |
+          cd openwrt
+          make download -j$(nproc)
+          find dl -size -1024c -exec rm -f {} \;
+          du -sh dl/
+
+      - name: 🔨 Compile Firmware
+        id: compile
+        run: |
+          cd openwrt
+          set -o pipefail
+          echo "🔨 开始编译 ($(nproc) 线程)..."
+          if make -j$(nproc) 2>&1 | tee build.log; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "✅ 多线程编译成功"
+          else
+            echo "⚠️ 多线程失败，单线程重试..."
+            make -j1 V=s > build-verbose.log 2>&1
+            MAKE_EXIT=$?
+            cat build-verbose.log >> build.log
+            if [ $MAKE_EXIT -eq 0 ]; then
+              echo "status=success" >> $GITHUB_OUTPUT
+              echo "✅ 单线程编译成功"
+            else
+              echo "status=failure" >> $GITHUB_OUTPUT
+              grep -iE "error:|fatal error:|undefined reference|No rule to make|Error [0-9]" \
+                build-verbose.log | grep -v "^#" | grep -v "Werror" | tail -60
+              tail -100 build-verbose.log
+              exit 1
+            fi
+          fi
+
+      - name: 🔍 固件体积检查
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          echo "=== 所有生成文件 ==="
+          find openwrt/bin/targets -type f | sort
+          echo ""
+          echo "=== 体积 ==="
+          find openwrt/bin/targets \( -name "*.bin" -o -name "*.ubi" \) \
+            2>/dev/null | xargs ls -lh 2>/dev/null || true
+          echo ""
+          echo "=== 安全阈值检查 ==="
+          find openwrt/bin/targets \( -name "*squashfs*" -o -name "*.ubi" \) \
+            2>/dev/null | while read f; do
+            SIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            MB=$(( SIZE / 1024 / 1024 ))
+            echo "  $f: ${MB}MB"
+            if [ "$SIZE" -gt 94371840 ]; then
+              echo "  ❌ 超过 90MB 硬上限，终止！"
+              exit 1
+            elif [ "$SIZE" -gt 78643200 ]; then
+              echo "  ⚠️  超过 75MB，接近风险线"
+            else
+              echo "  ✅ 体积安全"
+            fi
+          done
+
+      - name: 📦 Prepare Artifacts
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          TARGET_DIR="openwrt/bin/targets/qualcommax/ipq60xx"
+          [ -d "$TARGET_DIR" ] || { echo "❌ 目标目录不存在"; exit 1; }
+          cd "$TARGET_DIR"
+          mkdir -p output
+          cp *360v6* output/ 2>/dev/null || true
+          cp sha256sums output/ 2>/dev/null || true
+          ls output/*360v6* >/dev/null 2>&1 || { echo "❌ 未找到 360V6 固件"; exit 1; }
+          echo "✅ 固件已准备"
+          ls -lh output/
+          echo "FIRMWARE_PATH=$PWD/output" >> $GITHUB_ENV
+
+      - name: 🚀 Upload to Release
+        if: steps.compile.outputs.status == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: stable-v${{ github.run_number }}
+          name: OpenWrt 360 V6 (${{ env.BUILD_DATE }})
+          body: |
+            ## 📦 OpenWrt for 360 V6 (Qualcomm IPQ60xx)
+            - **构建时间**: ${{ env.BUILD_DATE }}
+            - **源码 Commit**: ${{ env.OPENWRT_COMMIT }}
+
+            ### ✨ 固件内置
+            - Argon 主题 + 中文界面
+            - **HomeProxy + sing-box**（代理，开箱即用）
+            - ttyd 网页终端
+            - ath11k 无线驱动（IPQ6000 板载 AX1800）
+            - USB 存储自动挂载（ext4/NTFS3）+ DiskMan
+            - SmartDNS（127.0.0.1:5335，dnsmasq 转发）
+            - DDNS + Cloudflare / UPnP / 流量监控
+            - IPv6 + ipv6helper / BBR 拥塞控制
+            - Docker 内核模块（kmod 内置，dockerd 首次启动后安装）
+            - CPU 频率调节
+
+            ### 🔧 首次启动后自动安装
+            - dockerd / docker-compose / luci-app-dockerman
+            - samba4-server / luci-app-samba4
+            - adguardhome / luci-app-adguardhome
+            - lucky / luci-app-lucky
+            - luci-app-fileassistant / luci-app-crontabs
+            - bash / htop / smartmontools
+
+            ### 📌 默认信息
+            - **管理地址**: http://192.168.2.1
+            - **用户名**: root，**密码**: 无
+            - **apk update** 现在可以正常工作（已使用 apk-openssl 编译）
+            - DNS: dnsmasq(53) → smartdns(5335)，无冲突
+
+          files: ${{ env.FIRMWARE_PATH }}/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📋 Build Log
+        if: always()
+        run: |
+          echo "=== .config SHA256（确认使用的配置）==="
+          sha256sum openwrt/.config 2>/dev/null || true
+          echo "=== build.log 最后 50 行 ==="
+          tail -50 openwrt/build.log 2>/dev/null || echo "(无)"
+          echo "=== build-verbose.log 最后 100 行 ==="
+          tail -100 openwrt/build-verbose.log 2>/dev/null || echo "(无，多线程成功)"
+          echo "=== bin 目录 ==="
+          find openwrt/bin -type f | sort
+          echo "=== 实际编译的 .config 关键项 ==="
+          grep -E "apk|DEVICE|homeproxy|sing.box|sfe" openwrt/.config | grep -v "^#" | sort
