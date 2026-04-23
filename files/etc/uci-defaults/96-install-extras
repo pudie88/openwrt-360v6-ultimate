@@ -1,8 +1,7 @@
 #!/bin/sh
-# 96-install-extras [Final-Best]
+# 96-install-extras [Final v3]
 # 适用：128M Flash + 512M RAM（360 V6 / 小米 CR660x 等）
-# 策略：方案一 Flash 保护 + 方案二 AGH 迁移完整性 + 修复方案三 DATA_ROOT bug
-# 改进：网络探测增强 / Flash 预检 / Swap 自动创建 / 失败重试 / 无 U 盘绝不写 Flash
+# 改进：Flash 三档保护 / Swap 自动创建 / I/O 优化 / avahi 修复 / AGH 迁移保护
 
 DONE_FLAG="/etc/install-extras-done"
 [ -f "$DONE_FLAG" ] && exit 0
@@ -21,17 +20,17 @@ log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; }
 [ -f "$LOCK" ]      && exit 0
 touch "$LOCK"
 
-log "▶ Final-Best 启动 | 128M Flash 保护模式"
+log "▶ Final v3 启动 | 128M Flash 保护模式"
 
 # ══════════════════════════════════════════════════════════════
-# 1. 清理无效 video 源（防 apk update 报错）
+# 1. 清理无效 video 源
 # ══════════════════════════════════════════════════════════════
 for f in /etc/apk/repositories.d/*.list; do
     [ -f "$f" ] && sed -i '/\/video\//d' "$f"
 done
 
 # ══════════════════════════════════════════════════════════════
-# 2. 等待网络（最长 3 分钟，双 DNS 轮询，比方案三的单次 ping 更可靠）
+# 2. 等待网络（最长 3 分钟，双 DNS 轮询）
 # ══════════════════════════════════════════════════════════════
 sleep 10
 NETWORK_OK=0
@@ -45,13 +44,12 @@ if [ "$NETWORK_OK" -eq 0 ]; then
     rm -f "$LOCK"; exit 1
 fi
 
-# 注入公共 DNS，绕过 SmartDNS 启动时序问题
 printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > /etc/resolv.conf
 log "✅ 网络与 DNS 就绪"
 
 # ══════════════════════════════════════════════════════════════
 # 3. 检测 U 盘（等待最长 30 秒）
-#    ⚠️ 修复方案三 bug：无 U 盘时绝不 fallback 到 /overlay（会写满 Flash）
+#    无 U 盘时绝不 fallback 到 /overlay，保护 Flash
 # ══════════════════════════════════════════════════════════════
 USB_MOUNT=""
 log "⏳ 检测 U 盘挂载..."
@@ -65,14 +63,13 @@ done
 if [ -n "$USB_MOUNT" ]; then
     log "✅ U 盘已挂载: $USB_MOUNT"
 else
-    log "⚠️ 未检测到 U 盘，重型应用（Docker/AGH）将跳过，保护 Flash"
+    log "⚠️  未检测到 U 盘，重型应用将跳过，保护 Flash"
 fi
 
 # ══════════════════════════════════════════════════════════════
 # 4. U 盘存在时：I/O 优化 + 内存参数
 # ══════════════════════════════════════════════════════════════
 if [ -n "$USB_MOUNT" ]; then
-    # I/O 调度器优化（降延迟 + 延长闪存寿命）
     USB_DEV=$(mount | grep " $USB_MOUNT " | awk '{print $1}' | sed 's|/dev/||;s|[0-9]*$||')
     SCHED_FILE="/sys/block/${USB_DEV}/queue/scheduler"
     if [ -f "$SCHED_FILE" ]; then
@@ -83,15 +80,14 @@ if [ -n "$USB_MOUNT" ]; then
         fi
     fi
 
-    # 内存优化：降低 swappiness，减少 U 盘不必要写入
     echo "10"    > /proc/sys/vm/swappiness      2>/dev/null
     echo "16384" > /proc/sys/vm/min_free_kbytes 2>/dev/null
     log "⚡ 内存参数: swappiness=10, min_free_kbytes=16MB"
 fi
 
 # ══════════════════════════════════════════════════════════════
-# 5. 自动创建 / 激活 Swap（仅 U 盘，不碰 Flash）
-#    512M RAM → 256M Swap；改自方案一，比方案二更自动化
+# 5. Swap 自动创建 / 激活（仅 U 盘，不碰 Flash）
+#    512M RAM → 自动创建 256M Swap
 # ══════════════════════════════════════════════════════════════
 if [ -n "$USB_MOUNT" ]; then
     if [ ! -f "$USB_MOUNT/swapfile" ]; then
@@ -103,17 +99,17 @@ if [ -n "$USB_MOUNT" ]; then
                 && chmod 600 "$USB_MOUNT/swapfile" \
                 && swapon "$USB_MOUNT/swapfile" 2>/dev/null \
                 && log "✅ Swap 256MB 已启用" \
-                || log "⚠️ Swap 创建失败，继续"
+                || log "⚠️  Swap 创建失败，继续"
         fi
     else
         swapon "$USB_MOUNT/swapfile" 2>/dev/null \
             && log "✅ 已有 Swap 已启用" \
-            || log "ℹ️ Swap 已挂载或启用失败，跳过"
+            || log "ℹ️  Swap 已挂载或启用失败，跳过"
     fi
 fi
 
 # ══════════════════════════════════════════════════════════════
-# 6. apk update（HTTPS→HTTP 自动降级，阈值 800 兼顾新旧镜像）
+# 6. apk update（HTTPS→HTTP 自动降级）
 # ══════════════════════════════════════════════════════════════
 apk_update_ok() {
     local out n
@@ -121,7 +117,7 @@ apk_update_ok() {
     n=$(echo "$out" | grep -oE 'OK: [0-9]+ distinct' | grep -oE '[0-9]+')
     [ "${n:-0}" -gt 800 ] && return 0
 
-    log "⚠️ HTTPS 包数不足（${n:-0}），切换 HTTP 重试..."
+    log "⚠️  HTTPS 包数不足（${n:-0}），切换 HTTP 重试..."
     for f in /etc/apk/repositories.d/*.list; do
         [ -f "$f" ] && sed -i 's|https://|http://|g' "$f"
     done
@@ -138,7 +134,7 @@ fi
 log "✅ apk update 成功"
 
 # ══════════════════════════════════════════════════════════════
-# 7. 安装辅助函数（带失败计数）
+# 7. 安装辅助函数（带失败计数，正确捕获退出码）
 # ══════════════════════════════════════════════════════════════
 INSTALL_FAIL=0
 install_pkg() {
@@ -146,52 +142,59 @@ install_pkg() {
     log "📦 安装: $*"
     out=$(apk add --no-cache "$@" 2>&1); ret=$?
     echo "$out" | logger -t "$LOG_TAG"
-    [ "$ret" -eq 0 ] && log "✅ 完成: $*" || {
-        log "⚠️ 失败: $*"
+    if [ "$ret" -eq 0 ]; then
+        log "✅ 完成: $*"
+    else
+        log "⚠️  失败: $*"
         INSTALL_FAIL=$((INSTALL_FAIL + 1))
-    }
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════
-# 8. Flash 剩余空间预检（核心保护，来自方案一）
-#    <30MB：跳过全部可选 LuCI 插件
-#    <15MB：连 Samba LuCI 也跳过，只装服务端
+# 8. Flash 剩余空间预检（三档保护）
+#    <30MB：跳过所有可选 LuCI
+#    <15MB：连 Samba LuCI 也跳过
 # ══════════════════════════════════════════════════════════════
 FLASH_FREE=$(df /overlay 2>/dev/null | awk 'NR==2 {print $4}')
 FLASH_USED=$(df /overlay 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
 log "📊 Flash 状态: 已用 ${FLASH_USED:-?}% | 剩余 ${FLASH_FREE:-?}KB"
 
-SKIP_LUCI_OPT=0    # 跳过可选 LuCI（dockerman / adguardhome）
-SKIP_LUCI_SMB=0    # 跳过 Samba LuCI
-
-if   [ "${FLASH_FREE:-99999}" -lt 15000 ]; then
-    log "🚨 Flash 剩余 <15MB，仅装服务端，全部 LuCI 跳过"
-    SKIP_LUCI_OPT=1; SKIP_LUCI_SMB=1
+SKIP_LUCI_OPT=0
+if [ "${FLASH_FREE:-99999}" -lt 15000 ]; then
+    log "🚨 Flash 剩余 <15MB，全部 LuCI 跳过"
+    SKIP_LUCI_OPT=1
 elif [ "${FLASH_FREE:-99999}" -lt 30000 ]; then
-    log "⚠️ Flash 剩余 <30MB，跳过可选 LuCI 插件"
+    log "⚠️  Flash 剩余 <30MB，跳过可选 LuCI 插件"
     SKIP_LUCI_OPT=1
 fi
 
 # ══════════════════════════════════════════════════════════════
-# 9. 基础工具（体积小，必装）
+# 9. 基础工具（必装）
 # ══════════════════════════════════════════════════════════════
 install_pkg smartmontools bash htop fdisk lsblk
 
 # ══════════════════════════════════════════════════════════════
 # 10. Samba（服务端必装；LuCI 视 Flash 情况）
+#     装完修复 dbus/avahi 热安装时序问题
 # ══════════════════════════════════════════════════════════════
 install_pkg samba4-server
-if [ "$SKIP_LUCI_SMB" -eq 0 ] && [ "$SKIP_LUCI_OPT" -eq 0 ]; then
+if [ "$SKIP_LUCI_OPT" -eq 0 ]; then
     install_pkg luci-app-samba4 luci-i18n-samba4-zh-cn
 else
-    log "ℹ️ 跳过 luci-app-samba4（Flash 紧张）"
+    log "ℹ️  跳过 luci-app-samba4（Flash 紧张）"
 fi
 
+# 修复：热安装后 dbus 未重载导致 avahi 崩溃循环
+/etc/init.d/dbus restart 2>/dev/null || true
+sleep 2
+/etc/init.d/avahi-daemon restart 2>/dev/null || true
+log "✅ dbus 已重载，avahi-daemon 已重启"
+
 # ══════════════════════════════════════════════════════════════
-# 11. 重型应用（必须有 U 盘才装，绝不写 Flash）
+# 11. 重型应用（必须有 U 盘，绝不写 Flash）
 # ══════════════════════════════════════════════════════════════
 if [ -n "$USB_MOUNT" ]; then
-    log "⚙️ U 盘就绪，开始安装重型应用..."
+    log "⚙️  U 盘就绪，开始安装重型应用..."
 
     # ── 11.1 Docker ──────────────────────────────────────────
     mkdir -p "$USB_MOUNT/docker-data" /etc/docker
@@ -202,14 +205,26 @@ if [ -n "$USB_MOUNT" ]; then
   "log-opts": {"max-size": "5m", "max-file": "2"}
 }
 EOF
-    log "✅ Docker daemon.json: data-root=$USB_MOUNT/docker-data | 日志 5m×2"
+    log "✅ daemon.json 已写入 | data-root=$USB_MOUNT/docker-data"
 
-    install_pkg docker dockerd
+    install_pkg docker
+
+    # dockerd 单独强制安装，绕过 kmod 版本依赖冲突
+    log "📦 强制安装: dockerd"
+    out=$(apk add --no-cache --force-broken-world dockerd 2>&1)
+    ret=$?
+    echo "$out" | logger -t "$LOG_TAG"
+    if [ "$ret" -eq 0 ]; then
+        log "✅ 完成: dockerd"
+    else
+        log "⚠️  失败: dockerd"
+        INSTALL_FAIL=$((INSTALL_FAIL + 1))
+    fi
 
     if [ "$SKIP_LUCI_OPT" -eq 0 ]; then
         install_pkg luci-app-dockerman luci-i18n-dockerman-zh-cn
     else
-        log "ℹ️ 跳过 luci-app-dockerman（Flash 紧张，可用 CLI 管理）"
+        log "ℹ️  跳过 luci-app-dockerman（Flash 紧张，可用 CLI 管理）"
     fi
 
     mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
@@ -219,34 +234,33 @@ EOF
 
     # ── 11.2 AdGuardHome ─────────────────────────────────────
     install_pkg adguardhome
-
     if [ "$SKIP_LUCI_OPT" -eq 0 ]; then
         install_pkg luci-app-adguardhome
     else
-        log "ℹ️ 跳过 luci-app-adguardhome（Flash 紧张，可用 :3000 Web 管理）"
+        log "ℹ️  跳过 luci-app-adguardhome（Flash 紧张，可用 :3000 Web 管理）"
     fi
 
     AGH_USB="$USB_MOUNT/AdGuardHome"
     mkdir -p "$AGH_USB/config" "$AGH_USB/data"
     /etc/init.d/adguardhome stop 2>/dev/null || true
 
-    # 迁移配置（来自方案二：优先保留旧数据，不覆盖）
+    # 优先保留 U 盘已有配置，重刷不覆盖
     if [ ! -f "$AGH_USB/config/adguardhome.yaml" ] \
     && [ -f "/etc/adguardhome/adguardhome.yaml" ]; then
         cp -a /etc/adguardhome/. "$AGH_USB/config/" 2>/dev/null
         log "✅ AGH 配置已迁移至 U 盘（首次）"
     else
-        log "ℹ️ AGH 配置已存在，直接复用，不覆盖"
+        log "ℹ️  AGH 配置已存在，直接复用，不覆盖"
     fi
 
-    # 迁移运行数据（仅首次且源目录非空）
+    # 运行数据仅首次且源目录非空才迁移
     if [ ! "$(ls -A "$AGH_USB/data" 2>/dev/null)" ] \
     && [ -d "/var/lib/adguardhome" ] \
     && [ "$(ls -A /var/lib/adguardhome 2>/dev/null)" ]; then
         cp -a /var/lib/adguardhome/. "$AGH_USB/data/" 2>/dev/null
         log "✅ AGH 运行数据已迁移至 U 盘（首次）"
     else
-        log "ℹ️ AGH 数据目录已有内容或源为空，跳过迁移"
+        log "ℹ️  AGH 数据目录已有内容或源为空，跳过迁移"
     fi
 
     uci set adguardhome.config.config_file="$AGH_USB/config/adguardhome.yaml" 2>/dev/null || true
@@ -258,15 +272,16 @@ EOF
     log "✅ AdGuardHome 已启动 | 配置+数据: $AGH_USB"
 
 else
-    log "ℹ️ 无 U 盘 → 跳过 Docker / AdGuardHome（保护 Flash）"
-    log "ℹ️ 插入 U 盘后执行: rm -f $DONE_FLAG && reboot"
+    log "ℹ️  无 U 盘 → 跳过 Docker / AdGuardHome（保护 Flash）"
+    log "ℹ️  插入 U 盘后执行: rm -f $DONE_FLAG && reboot"
 fi
 
 # ══════════════════════════════════════════════════════════════
-# 12. 刷新 LuCI 缓存
+# 12. 刷新 LuCI 缓存 & 清理触发器
 # ══════════════════════════════════════════════════════════════
 rm -f /tmp/luci-indexcache* 2>/dev/null || true
 /etc/init.d/rpcd restart 2>/dev/null || true
+rm -f /etc/hotplug.d/iface/99-install-extras
 rm -f "$LOCK"
 
 # ══════════════════════════════════════════════════════════════
@@ -275,11 +290,11 @@ rm -f "$LOCK"
 if [ "$INSTALL_FAIL" -eq 0 ]; then
     FLASH_FINAL=$(df /overlay 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
     touch "$DONE_FLAG"
-    log "🎉 Final-Best 部署完成！Flash 使用率: ${FLASH_FINAL:-?}%"
+    log "🎉 Final v3 部署完成！Flash 使用率: ${FLASH_FINAL:-?}%"
     [ "${FLASH_FINAL:-0}" -gt 85 ] && \
-        log "⚠️ Flash >85%，建议: apk cache clean && logread | head"
+        log "⚠️  Flash >85%，建议执行: apk cache clean"
 else
-    log "⚠️ 有 $INSTALL_FAIL 组包失败，注册 hotplug 下次 WAN UP 自动重试"
+    log "⚠️  有 $INSTALL_FAIL 组包失败，注册 hotplug 下次 WAN UP 自动重试"
     mkdir -p /etc/hotplug.d/iface
     cat > /etc/hotplug.d/iface/99-install-extras << 'RETRYEOF'
 #!/bin/sh
@@ -294,7 +309,7 @@ RUNEOF
 
 chmod +x /usr/lib/install-extras/run.sh
 
-# ── 安装首次触发的 hotplug ───────────────────────────────────────────
+# ── 首次触发 hotplug ─────────────────────────────────────────────────
 mkdir -p /etc/hotplug.d/iface
 cat > /etc/hotplug.d/iface/99-install-extras << 'HOTEOF'
 #!/bin/sh
@@ -305,5 +320,5 @@ case "$INTERFACE" in wan|wan6|pppoe-wan) ;; *) exit 0 ;; esac
 HOTEOF
 chmod +x /etc/hotplug.d/iface/99-install-extras
 
-logger -t "install-extras" "✅ Final-Best 已安装，等待 WAN UP 触发"
+logger -t "install-extras" "✅ Final v3 已安装，等待 WAN UP 触发"
 exit 0
