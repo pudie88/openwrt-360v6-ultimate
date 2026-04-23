@@ -170,7 +170,5 @@ rm -f /etc/install-extras-done
 
 ---
 
-- 核心特性表格
-- 体积说明
 
 需要我调整或补充任何内容吗？
