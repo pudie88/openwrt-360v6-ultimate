@@ -1,0 +1,17 @@
+#!/bin/sh
+# 98-fix-apk-feeds
+
+# ── 清理 video feed ────────────────────────────────────────────────
+for f in /etc/apk/repositories.d/*.list; do
+    [ -f "$f" ] && sed -i '/\/video\//d' "$f"
+done
+
+# ── world 文件：apk-mbedtls → apk-openssl ─────────────────────────
+WORLD="/etc/apk/world"
+if [ -f "$WORLD" ] && grep -q "^apk-mbedtls$" "$WORLD"; then
+    sed -i 's/^apk-mbedtls$/apk-openssl/' "$WORLD"
+    logger -t "98-fix-apk-feeds" "✅ apk world: apk-mbedtls → apk-openssl"
+fi
+
+logger -t "98-fix-apk-feeds" "✅ feeds 修复完成"
+exit 0
