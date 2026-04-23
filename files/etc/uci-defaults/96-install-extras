@@ -1,7 +1,5 @@
 #!/bin/sh
-# 96-install-extras 融合版（修复版）
-# 模式1（高级）：U盘成为 /overlay，彻底扩容
-# 模式2（默认）：程序在闪存，数据在U盘
+# 96-install-extras (原版 + V4 优化移植)
 
 DONE_FLAG="/etc/install-extras-done"
 [ -f "$DONE_FLAG" ] && exit 0
@@ -20,7 +18,7 @@ log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; }
 [ -f "$LOCK" ] && exit 0
 touch "$LOCK"
 
-log "▶ install-extras 启动（融合版）"
+log "▶ install-extras 开始（优化版）"
 
 # ── 清理 video feed ──────────────────────────────────────────────────
 for f in /etc/apk/repositories.d/*.list; do
@@ -41,191 +39,61 @@ if [ "$NETWORK_OK" -eq 0 ]; then
 fi
 log "✅ 网络就绪"
 
+# ── 强制写入公共 DNS ─────────────────────────────────────────────────
 printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > /etc/resolv.conf
-log "✅ DNS 注入"
+log "✅ DNS 注入：223.5.5.5 / 8.8.8.8"
 
-# ════════════════════════════════════════════════════════════════════
-# 辅助函数：获取设备挂载点对应的块设备（不依赖 findmnt）
-# ════════════════════════════════════════════════════════════════════
-get_dev_from_mount() {
-    local mountpoint="$1"
-    mount | grep -E " on $mountpoint " | awk '{print $1}' | head -1
-}
-
-# ════════════════════════════════════════════════════════════════════
-# 检测当前是否已处于 overlay 模式（U盘作为 /overlay）
-# ════════════════════════════════════════════════════════════════════
-is_overlay_active() {
-    local upper
-    upper=$(mount | grep 'on /overlay type overlay' | grep -o 'upperdir=[^,]*' | cut -d= -f2)
-    [ -z "$upper" ] && return 1
-    # 检查 upperdir 是否在 U 盘设备上
-    echo "$upper" | grep -qE '/(mnt/sd|overlay/upper)' && return 0
-    return 1
-}
-
-# ════════════════════════════════════════════════════════════════════
-# 检测 U 盘并确定工作模式
-# ════════════════════════════════════════════════════════════════════
+# ── 检测 U 盘 ────────────────────────────────────────────────────────
 USB_MOUNT=""
-OVERLAY_MODE=0      # 0=数据模式（原版），1=扩容模式（新版）
-OVERLAY_ALREADY=0   # 当前是否已处于 overlay 模式
-
-# 检查当前是否已处于 overlay 模式
-if is_overlay_active; then
-    log "✅ 已处于 overlay 模式（U盘为系统存储）"
-    OVERLAY_ALREADY=1
-    OVERLAY_MODE=1
-fi
-
-# 检测 U 盘挂载点
 log "⏳ 检测 U 盘挂载..."
 for i in $(seq 1 15); do
     for mp in /mnt/sda1 /mnt/sda /mnt/usb /mnt/mmcblk0p1; do
-        if mountpoint -q "$mp" 2>/dev/null; then
-            USB_MOUNT="$mp"
-            break 2
-        fi
+        mountpoint -q "$mp" 2>/dev/null && { USB_MOUNT="$mp"; break 2; }
     done
-    # 尝试挂载未挂载的 U 盘
-    if [ -b /dev/sda1 ] && ! mountpoint -q /mnt/sda1 2>/dev/null; then
-        mkdir -p /mnt/sda1
-        mount /dev/sda1 /mnt/sda1 2>/dev/null && USB_MOUNT="/mnt/sda1"
-    fi
     sleep 2
 done
 
+# ═════════════════════════════════════════════════════════════════════
+# 🔧 V4 优化点1：I/O 调度 & 内存优化
+# ═════════════════════════════════════════════════════════════════════
 if [ -n "$USB_MOUNT" ]; then
     log "✅ U 盘已挂载: $USB_MOUNT"
     
-    # 仅在非 overlay 模式下判断是否要切换
-    if [ "$OVERLAY_ALREADY" -eq 0 ]; then
-        USB_DEV=$(get_dev_from_mount "$USB_MOUNT")
-        USB_SIZE=$(df "$USB_MOUNT" | awk 'NR==2 {print $2}')
-        
-        # 条件：U盘容量 > 4GB 且 用户创建了 .enable-overlay 标记文件
-        if [ "$USB_SIZE" -gt 4194304 ] && [ -f "$USB_MOUNT/.enable-overlay" ]; then
-            log "⚡ 检测到 .enable-overlay 标记，启用 overlay 扩容模式"
-            OVERLAY_MODE=1
-        elif [ "$USB_SIZE" -gt 4194304 ]; then
-            log "ℹ️ U盘容量充足（>4GB），如需启用 overlay 模式请执行："
-            log "    touch $USB_MOUNT/.enable-overlay && reboot"
+    # I/O 调度器优化
+    USB_DEV=$(mount | grep "$USB_MOUNT" | awk '{print $1}' | sed 's/[0-9]*//g')
+    if [ -n "$USB_DEV" ] && [ -f "/sys/block/$USB_DEV/queue/scheduler" ]; then
+        if grep -q "mq-deadline" "/sys/block/$USB_DEV/queue/scheduler" 2>/dev/null; then
+            echo "mq-deadline" > "/sys/block/$USB_DEV/queue/scheduler" 2>/dev/null
+            log "⚡ I/O 调度器: mq-deadline"
+        elif grep -q "deadline" "/sys/block/$USB_DEV/queue/scheduler" 2>/dev/null; then
+            echo "deadline" > "/sys/block/$USB_DEV/queue/scheduler" 2>/dev/null
+            log "⚡ I/O 调度器: deadline"
         fi
     fi
+    
+    # 降低 swappiness，减少 U 盘写入
+    echo "10" > /proc/sys/vm/swappiness 2>/dev/null
+    log "⚡ 内存优化: swappiness=10"
 else
-    log "⚠️ 未检测到 U 盘，仅安装基础工具"
+    log "⚠️ 未检测到 U 盘，docker/AdGuardHome 相关将跳过"
 fi
 
-# ════════════════════════════════════════════════════════════════════
-# 模式1：overlay 扩容（新版核心功能）
-# 条件：用户想要扩容模式，且当前尚未处于 overlay 模式
-# ════════════════════════════════════════════════════════════════════
-if [ "$OVERLAY_MODE" -eq 1 ] && [ "$OVERLAY_ALREADY" -eq 0 ] && [ -n "$USB_MOUNT" ]; then
-    
-    log "🔧 开始 overlay 扩容模式..."
-    
-    USB_DEV=$(get_dev_from_mount "$USB_MOUNT")
-    log "📌 U盘设备: $USB_DEV"
-    
-    # 检查 mkfs.ext4 是否可用（此时网络已通，可以安装）
-    if ! command -v mkfs.ext4 >/dev/null 2>&1; then
-        log "📦 安装 e2fsprogs（提供 mkfs.ext4）..."
-        apk add --no-cache e2fsprogs 2>&1 | logger -t "$LOG_TAG"
-        if ! command -v mkfs.ext4 >/dev/null 2>&1; then
-            log "❌ mkfs.ext4 安装失败，放弃扩容"
-            rm -f "$LOCK"; exit 1
-        fi
+# ═════════════════════════════════════════════════════════════════════
+# 🔧 V4 优化点2：智能 Swap（自动创建）
+# ═════════════════════════════════════════════════════════════════════
+if [ -n "$USB_MOUNT" ] && [ ! -f "$USB_MOUNT/swapfile" ]; then
+    MEM_TOTAL=$(free -k | awk '/^Mem:/ {print $2}')
+    # 512MB 内存，创建 256MB swap 足够
+    if [ "$MEM_TOTAL" -lt 1048576 ]; then
+        log "⏳ 自动创建 256MB Swap..."
+        dd if=/dev/zero of="$USB_MOUNT/swapfile" bs=1M count=256 2>/dev/null
+        mkswap "$USB_MOUNT/swapfile" 2>/dev/null
+        chmod 600 "$USB_MOUNT/swapfile"
+        swapon "$USB_MOUNT/swapfile" 2>/dev/null && log "✅ Swap 已启用"
     fi
-    
-    # 卸载 U 盘准备格式化
-    umount "$USB_MOUNT" 2>/dev/null
-    
-    # 检查文件系统，不是 ext4 则格式化
-    FS_TYPE=$(blkid -s TYPE -o value "$USB_DEV" 2>/dev/null)
-    if [ "$FS_TYPE" != "ext4" ]; then
-        log "🔧 格式化 U 盘为 ext4..."
-        mkfs.ext4 -F -L "owrt-overlay" "$USB_DEV" 2>&1 | logger -t "$LOG_TAG"
-        if [ $? -ne 0 ]; then
-            log "❌ 格式化失败，放弃扩容"
-            rm -f "$LOCK"; exit 1
-        fi
-        log "✅ 格式化完成"
-    else
-        log "✅ 已是 ext4，跳过格式化"
-    fi
-    
-    # 重新挂载
-    mount "$USB_DEV" "$USB_MOUNT"
-    
-    # 创建 overlay 目录
-    mkdir -p "$USB_MOUNT/upper" "$USB_MOUNT/work"
-    
-    # 迁移现有配置
-    if [ -d "/overlay/upper" ] && [ "$(ls -A /overlay/upper 2>/dev/null)" ]; then
-        log "📦 迁移现有配置到 U 盘..."
-        cp -a /overlay/upper/. "$USB_MOUNT/upper/" 2>/dev/null
-        log "✅ 配置迁移完成"
-    fi
-    
-    # 获取 UUID
-    USB_UUID=$(blkid -s UUID -o value "$USB_DEV")
-    if [ -z "$USB_UUID" ]; then
-        log "❌ 无法获取 UUID，放弃扩容"
-        rm -f "$LOCK"; exit 1
-    fi
-    
-    # 配置 fstab
-    cat > /etc/config/fstab << FSTAB_EOF
-config global
-    option anon_swap '0'
-    option anon_mount '0'
-    option auto_swap '1'
-    option auto_mount '1'
-    option delay_root '8'
-    option check_fs '0'
-
-config mount
-    option target '/overlay'
-    option uuid '$USB_UUID'
-    option fstype 'ext4'
-    option options 'rw,noatime'
-    option enabled '1'
-    option enabled_fsck '0'
-FSTAB_EOF
-
-    uci commit fstab
-    /etc/init.d/fstab enable 2>/dev/null || true
-    
-    # 写入标记
-    touch "$USB_MOUNT/.overlay-active"
-    sync
-    
-    log "✅ overlay 配置完成，5秒后重启..."
-    sleep 5
-    reboot
-    exit 0
-fi
-
-# ════════════════════════════════════════════════════════════════════
-# 模式2：兼容原版（应用程序在闪存，数据在U盘）
-# ════════════════════════════════════════════════════════════════════
-
-# 确定数据目录路径
-if [ "$OVERLAY_ALREADY" -eq 1 ]; then
-    # 已处于 overlay 模式，使用 /overlay 路径
-    DOCKER_DATA="/overlay/docker-data"
-    AGH_DIR="/overlay/adguardhome"
-    log "📌 使用 overlay 路径: /overlay"
-else
-    # 原版模式：使用 U 盘挂载点
-    if [ -n "$USB_MOUNT" ]; then
-        DOCKER_DATA="$USB_MOUNT/docker-data"
-        AGH_DIR="$USB_MOUNT/AdGuardHome"
-        log "📌 使用 U 盘路径: $USB_MOUNT"
-    else
-        DOCKER_DATA=""
-        AGH_DIR=""
-    fi
+elif [ -n "$USB_MOUNT" ] && [ -f "$USB_MOUNT/swapfile" ]; then
+    # 原版逻辑：检测到现有 swapfile 就启用
+    swapon "$USB_MOUNT/swapfile" 2>/dev/null && log "✅ 已开启现有 Swap"
 fi
 
 # ── apk update ───────────────────────────────────────────────────────
@@ -235,10 +103,11 @@ apk_update_ok() {
     echo "$out" | logger -t "$LOG_TAG"
     n=$(echo "$out" | grep -oE 'OK: [0-9]+ distinct' | grep -oE '[0-9]+')
     [ "${n:-0}" -gt 1000 ] && return 0
-    
+
     log "⚠️ HTTPS 包数不足（${n:-0}），切换 HTTP..."
     for f in /etc/apk/repositories.d/*.list; do
-        [ -f "$f" ] && sed -i 's|https://downloads.immortalwrt.org|http://downloads.immortalwrt.org|g' "$f"
+        [ -f "$f" ] && sed -i \
+            's|https://downloads.immortalwrt.org|http://downloads.immortalwrt.org|g' "$f"
     done
     out=$(apk update 2>&1)
     echo "$out" | logger -t "$LOG_TAG"
@@ -248,7 +117,7 @@ apk_update_ok() {
 }
 
 if ! apk_update_ok; then
-    log "❌ apk update 失败"
+    log "❌ apk update 失败，等下次重试"
     rm -f "$LOCK"; exit 1
 fi
 log "✅ apk update 成功"
@@ -269,88 +138,75 @@ install_pkg() {
     fi
 }
 
-# ── 基础工具（总是安装）──────────────────────────────────────────────
+# ── 轻量工具 ─────────────────────────────────────────────────────────
 install_pkg smartmontools bash htop fdisk lsblk
+
+# ── 中等体积 ─────────────────────────────────────────────────────────
 install_pkg samba4-server luci-app-samba4 luci-i18n-samba4-zh-cn
 
 # ── 重型应用 ─────────────────────────────────────────────────────────
-if [ -n "$USB_MOUNT" ] || [ "$OVERLAY_ALREADY" -eq 1 ]; then
-    log "⚙️ 存储设备就绪，安装重型应用..."
-    
-    # Swap 支持（仅原版模式，overlay 模式不需要）
-    if [ "$OVERLAY_ALREADY" -eq 0 ] && [ -n "$USB_MOUNT" ]; then
-        if [ -f "$USB_MOUNT/swapfile" ]; then
-            swapon "$USB_MOUNT/swapfile" 2>/dev/null && log "✅ Swap 已开启"
-        else
-            log "ℹ️ 创建 swap: dd if=/dev/zero of=$USB_MOUNT/swapfile bs=1M count=512"
-        fi
-    fi
-    
-    # Docker 安装
-    if [ -n "$DOCKER_DATA" ]; then
-        mkdir -p "$DOCKER_DATA" /etc/docker
-        cat > /etc/docker/daemon.json << EOF
-{
-  "data-root": "$DOCKER_DATA",
-  "log-driver": "json-file",
-  "log-opts": {"max-size": "10m", "max-file": "3"}
-}
-EOF
-        log "✅ Docker data-root: $DOCKER_DATA"
-    fi
-    
-    install_pkg docker
-    
-    # dockerd 需要 --force-broken-world
-    log "📦 强制安装: dockerd luci-app-dockerman"
-    out=$(apk add --no-cache --force-broken-world dockerd luci-app-dockerman luci-i18n-dockerman-zh-cn 2>&1)
-    ret=$?
-    echo "$out" | logger -t "$LOG_TAG"
-    if [ "$ret" -eq 0 ]; then
-        log "✅ 完成: dockerd luci-app-dockerman"
-    else
-        log "⚠️ 失败: dockerd luci-app-dockerman"
-        INSTALL_FAIL=$((INSTALL_FAIL + 1))
-    fi
-    
-    mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
+if [ -n "$USB_MOUNT" ]; then
+    log "⚙️ U 盘已就绪，准备安装重型应用..."
+
+    # Docker
+    mkdir -p "$USB_MOUNT/docker-data"
+    mkdir -p /etc/docker
+    printf '{\n  "data-root": "%s/docker-data",\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "10m", "max-file": "3"}\n}\n' \
+        "$USB_MOUNT" > /etc/docker/daemon.json
+    log "✅ daemon.json 已写入，data-root → $USB_MOUNT/docker-data"
+
+    install_pkg docker dockerd
+    install_pkg luci-app-dockerman luci-i18n-dockerman-zh-cn
+
+    mountpoint -q /sys/fs/cgroup || \
+        mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
+
     /etc/init.d/dockerd enable 2>/dev/null || true
-    /etc/init.d/dockerd start 2>/dev/null || true
-    
+    /etc/init.d/dockerd start  2>/dev/null || true
+    log "✅ Docker 已启动，数据目录 → $USB_MOUNT/docker-data"
+
     # AdGuardHome
-    if [ -n "$AGH_DIR" ]; then
-        install_pkg adguardhome luci-app-adguardhome
-        mkdir -p "$AGH_DIR"/{data,config}
-        
-        /etc/init.d/adguardhome stop 2>/dev/null || true
-        
-        if [ ! -f "$AGH_DIR/config/adguardhome.yaml" ] && [ -f "/etc/adguardhome/adguardhome.yaml" ]; then
-            cp -a /etc/adguardhome/. "$AGH_DIR/config/"
-            log "✅ 配置已迁移到 $AGH_DIR"
-        fi
-        
-        uci set adguardhome.config.config_file="$AGH_DIR/config/adguardhome.yaml"
-        uci set adguardhome.config.work_dir="$AGH_DIR/data"
-        uci commit adguardhome
-        
-        /etc/init.d/adguardhome enable 2>/dev/null || true
-        /etc/init.d/adguardhome start 2>/dev/null || true
-        log "✅ AdGuardHome 已配置"
+    install_pkg adguardhome luci-app-adguardhome
+
+    AGH_USB="$USB_MOUNT/AdGuardHome"
+    mkdir -p "$AGH_USB/data"
+    mkdir -p "$AGH_USB/config"
+
+    /etc/init.d/adguardhome stop 2>/dev/null || true
+
+    if [ ! -f "$AGH_USB/config/adguardhome.yaml" ] && \
+       [ -f "/etc/adguardhome/adguardhome.yaml" ]; then
+        cp -a /etc/adguardhome/. "$AGH_USB/config/"
+        log "✅ 新环境，初始配置已写入 U 盘 → $AGH_USB/config/"
+    else
+        log "ℹ️ U 盘已存在旧配置，直接复用，不覆盖"
     fi
+
+    uci set adguardhome.config.config_file="$AGH_USB/config/adguardhome.yaml"
+    uci set adguardhome.config.work_dir="$AGH_USB/data"
+    uci commit adguardhome
+    log "✅ AdGuardHome uci 配置已更新"
+
+    /etc/init.d/adguardhome enable 2>/dev/null || true
+    /etc/init.d/adguardhome start  2>/dev/null || true
+    log "✅ AdGuardHome 已启动，完全运行于 U 盘"
+
 else
-    log "ℹ️ 无 U 盘，跳过 Docker/AdGuardHome"
-    log "ℹ️ 插入 U 盘后重启可自动安装"
+    log "ℹ️ 无 U 盘，跳过 AdGuardHome 和 Docker 安装"
+    log "ℹ️ 插入 U 盘后执行: rm /etc/install-extras-done && reboot"
 fi
 
-# ── 清理 ──────────────────────────────────────────────────────────────
+# ── 刷新 LuCI ────────────────────────────────────────────────────────
 rm -f /tmp/luci-indexcache* 2>/dev/null
 /etc/init.d/rpcd restart 2>/dev/null || true
+
 rm -f /etc/hotplug.d/iface/99-install-extras
 rm -f "$LOCK"
 
+# ── 写 DONE_FLAG ─────────────────────────────────────────────────────
 if [ "$INSTALL_FAIL" -eq 0 ]; then
     touch "$DONE_FLAG"
-    log "🎉 安装完成"
+    log "🎉 install-extras 全部完成"
 else
     log "⚠️ 有 $INSTALL_FAIL 组包失败，下次 WAN UP 重试"
     mkdir -p /etc/hotplug.d/iface
@@ -382,7 +238,8 @@ case "$INTERFACE" in
 esac
 /usr/lib/install-extras/run.sh &
 HOTPLUGEOF
+
 chmod +x /etc/hotplug.d/iface/99-install-extras
 
-logger -t "96-install-extras" "✅ 融合版触发器已安装"
+logger -t "96-install-extras" "✅ hotplug 触发器已安装（优化版）"
 exit 0
