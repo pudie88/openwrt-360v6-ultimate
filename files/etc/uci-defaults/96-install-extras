@@ -1,8 +1,8 @@
 #!/bin/sh
-# 96-install-extras [Final v4.4]
+# 96-install-extras [Final v4.5]
 # 适用：360 V6 / 小米 CR660x / IPQ6000 (128M Flash)
-# 修复：apk锁等待 / dockerd强制安装 / run.sh完成后主动检测U盘 / block hotplug竞态
-# v4.4 修复：U盘已插但挂载慢导致轮询超时未检测到的问题
+# v4.5 修复：去除 run.sh 中的轮询和主动 mount，避免与系统 hotplug 竞态
+#           run.sh 完成后只做一次同步检查，未挂载则交由 99-usb-extras 哨兵处理
 
 DONE_FLAG="/etc/install-extras-done"
 USB_DONE="/etc/install-usb-done"
@@ -267,7 +267,7 @@ log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; }
 [ -f "$LOCK" ]      && { log "⚠️  实例运行中，跳过"; exit 0; }
 touch "$LOCK"
 
-log "▶ Final v4.4 基础环境启动"
+log "▶ Final v4.5 基础环境启动"
 
 # ── 清理无效软件源 ───────────────────────────────────────────
 for f in /etc/apk/repositories.d/*.list; do
@@ -384,51 +384,23 @@ FLASH_FINAL=$(df /overlay 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
 log "🎉 基础环境部署完成！Flash: ${FLASH_FINAL:-?}%"
 [ "${FLASH_FINAL:-0}" -gt 85 ] && log "⚠️  Flash >85%，建议: apk cache clean"
 
-# ── 基础环境完成后主动检测 U 盘 ────────────────────────────
-# v4.4 修复：block hotplug 挂载是异步的，run.sh 轮询时挂载可能尚未完成
-# 策略：mountpoint 轮询 → 失败则主动尝试挂载块设备 → 再等 30 秒补检
+# ── 基础环境完成后检测 U 盘 ────────────────────────────────
+# v4.5：不做轮询、不做主动 mount，避免与系统 hotplug 竞态
+# 只做一次同步检查：
+#   - 已挂载 → 直接触发安装（处理"U 盘在基础环境期间已被系统挂好"的场景）
+#   - 未挂载 → 什么都不做，99-usb-extras 哨兵会在 hotplug add 时自动触发
 if [ ! -f "$USB_DONE" ]; then
-    log "⏳ 检测 U 盘（等待最长 60 秒）..."
     USB_MOUNT=""
-
-    # 第一轮：mountpoint 轮询（60 秒）
-    for i in $(seq 1 30); do
-        for mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
-            mountpoint -q "$mp" 2>/dev/null && { USB_MOUNT="$mp"; break 2; }
-        done
-        sleep 2
+    for mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
+        mountpoint -q "$mp" 2>/dev/null && { USB_MOUNT="$mp"; break; }
     done
 
-    # 第二轮：若仍未找到，主动尝试挂载已存在的块设备（兼容挂载慢的情况）
-    if [ -z "$USB_MOUNT" ]; then
-        log "⏳ mountpoint 未就绪，尝试主动挂载块设备..."
-        for dev in /dev/sda1 /dev/sda /dev/sdb1 /dev/sdb; do
-            if [ -b "$dev" ]; then
-                mp="/mnt/$(basename "$dev")"
-                mkdir -p "$mp"
-                if mount "$dev" "$mp" 2>/dev/null; then
-                    log "✅ 主动挂载成功: $dev → $mp"
-                    USB_MOUNT="$mp"
-                    break
-                fi
-            fi
-        done
-    fi
-
-    # 第三轮：再等 30 秒补检（应对系统异步挂载比预期更慢的极端情况）
-    if [ -z "$USB_MOUNT" ]; then
-        log "⏳ 等待 30 秒后补检挂载点..."
-        sleep 30
-        for mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
-            mountpoint -q "$mp" 2>/dev/null && { USB_MOUNT="$mp"; break; }
-        done
-    fi
-
     if [ -n "$USB_MOUNT" ]; then
-        log "✅ 检测到 U 盘: $USB_MOUNT，触发重型应用安装..."
-        /usr/lib/install-extras/install-usb.sh "$USB_MOUNT"
+        log "✅ 检测到 U 盘已挂载: $USB_MOUNT，触发重型应用安装..."
+        /usr/lib/install-extras/install-usb.sh "$USB_MOUNT" &
     else
-        log "ℹ️  未检测到 U 盘，启用 zram 兜底..."
+        log "ℹ️  U 盘暂未挂载，等待 hotplug 哨兵自动触发..."
+        # zram 兜底（若内核支持），保障内存
         if modprobe zram num_devices=1 2>/dev/null && [ -e /sys/block/zram0/disksize ]; then
             echo "256M" > /sys/block/zram0/disksize 2>/dev/null
             mkswap /dev/zram0 >/dev/null 2>&1
@@ -438,7 +410,6 @@ if [ ! -f "$USB_DONE" ]; then
         else
             log "⚠️  zram 不可用（内核不支持）"
         fi
-        log "ℹ️  插入 U 盘后将自动安装 Docker/AGH"
     fi
 fi
 
@@ -464,14 +435,17 @@ esac
 EOF
 
 # 磁盘哨兵：U 盘热插拔 → 触发重型应用
-# 作为兜底：基础环境完成但 U 盘当时未就绪，热插后自动补装
+# 兼容两种场景：
+#   1. 正常流程：基础环境完成后 U 盘挂载触发 add 事件
+#   2. 补漏流程：基础环境完成时 U 盘已挂载（无 add 事件），由 run.sh 直接触发
+# 注意：系统自带 hotplug 脚本已负责 mount，这里只等挂载完成后触发安装
 cat > /etc/hotplug.d/block/99-usb-extras << 'EOF'
 #!/bin/sh
 [ "$ACTION" = "add" ]           || exit 0
 [ -f /etc/install-usb-done ]    && exit 0
 [ -f /etc/install-extras-done ] || exit 0
 
-# 等待挂载点就绪（最长 30 秒）
+# 等待系统 hotplug 完成挂载（最长 30 秒）
 MP=""
 for i in $(seq 1 15); do
     for mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
@@ -492,6 +466,6 @@ EOF
 chmod +x /etc/hotplug.d/iface/99-install-extras
 chmod +x /etc/hotplug.d/block/99-usb-extras
 
-logger -t "install-extras" "✅ Final v4.4 哨兵系统已就绪"
+logger -t "install-extras" "✅ Final v4.5 哨兵系统已就绪"
 logger -t "install-extras" "💡 执行 '360v6-status' 查看部署状态"
 exit 0
