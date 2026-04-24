@@ -1,7 +1,8 @@
 #!/bin/sh
-# 96-install-extras [Final v4.3]
+# 96-install-extras [Final v4.4]
 # 适用：360 V6 / 小米 CR660x / IPQ6000 (128M Flash)
 # 修复：apk锁等待 / dockerd强制安装 / run.sh完成后主动检测U盘 / block hotplug竞态
+# v4.4 修复：U盘已插但挂载慢导致轮询超时未检测到的问题
 
 DONE_FLAG="/etc/install-extras-done"
 USB_DONE="/etc/install-usb-done"
@@ -266,7 +267,7 @@ log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; }
 [ -f "$LOCK" ]      && { log "⚠️  实例运行中，跳过"; exit 0; }
 touch "$LOCK"
 
-log "▶ Final v4.3 基础环境启动"
+log "▶ Final v4.4 基础环境启动"
 
 # ── 清理无效软件源 ───────────────────────────────────────────
 for f in /etc/apk/repositories.d/*.list; do
@@ -373,26 +374,55 @@ log "✅ dbus/avahi-daemon 已重载"
 # ── 收尾基础环境 ────────────────────────────────────────────
 rm -f "$LOCK"
 
-if [ "$INSTALL_FAIL" -eq 0 ]; then
-    touch "$DONE_FLAG"
-    FLASH_FINAL=$(df /overlay 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
-    log "🎉 基础环境部署完成！Flash: ${FLASH_FINAL:-?}%"
-    [ "${FLASH_FINAL:-0}" -gt 85 ] && log "⚠️  Flash >85%，建议: apk cache clean"
-else
+if [ "$INSTALL_FAIL" -ne 0 ]; then
     log "⚠️  $INSTALL_FAIL 组包失败，下次 WAN UP 自动重试"
-    rm -f "$LOCK"; exit 1
+    exit 1
 fi
 
-# ── 基础环境完成后主动检测 U 盘（带轮询，等待挂载就绪）────
+touch "$DONE_FLAG"
+FLASH_FINAL=$(df /overlay 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
+log "🎉 基础环境部署完成！Flash: ${FLASH_FINAL:-?}%"
+[ "${FLASH_FINAL:-0}" -gt 85 ] && log "⚠️  Flash >85%，建议: apk cache clean"
+
+# ── 基础环境完成后主动检测 U 盘 ────────────────────────────
+# v4.4 修复：block hotplug 挂载是异步的，run.sh 轮询时挂载可能尚未完成
+# 策略：mountpoint 轮询 → 失败则主动尝试挂载块设备 → 再等 30 秒补检
 if [ ! -f "$USB_DONE" ]; then
     log "⏳ 检测 U 盘（等待最长 60 秒）..."
     USB_MOUNT=""
+
+    # 第一轮：mountpoint 轮询（60 秒）
     for i in $(seq 1 30); do
         for mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
             mountpoint -q "$mp" 2>/dev/null && { USB_MOUNT="$mp"; break 2; }
         done
         sleep 2
     done
+
+    # 第二轮：若仍未找到，主动尝试挂载已存在的块设备（兼容挂载慢的情况）
+    if [ -z "$USB_MOUNT" ]; then
+        log "⏳ mountpoint 未就绪，尝试主动挂载块设备..."
+        for dev in /dev/sda1 /dev/sda /dev/sdb1 /dev/sdb; do
+            if [ -b "$dev" ]; then
+                mp="/mnt/$(basename "$dev")"
+                mkdir -p "$mp"
+                if mount "$dev" "$mp" 2>/dev/null; then
+                    log "✅ 主动挂载成功: $dev → $mp"
+                    USB_MOUNT="$mp"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    # 第三轮：再等 30 秒补检（应对系统异步挂载比预期更慢的极端情况）
+    if [ -z "$USB_MOUNT" ]; then
+        log "⏳ 等待 30 秒后补检挂载点..."
+        sleep 30
+        for mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
+            mountpoint -q "$mp" 2>/dev/null && { USB_MOUNT="$mp"; break; }
+        done
+    fi
 
     if [ -n "$USB_MOUNT" ]; then
         log "✅ 检测到 U 盘: $USB_MOUNT，触发重型应用安装..."
@@ -462,6 +492,6 @@ EOF
 chmod +x /etc/hotplug.d/iface/99-install-extras
 chmod +x /etc/hotplug.d/block/99-usb-extras
 
-logger -t "install-extras" "✅ Final v4.3 哨兵系统已就绪"
+logger -t "install-extras" "✅ Final v4.4 哨兵系统已就绪"
 logger -t "install-extras" "💡 执行 '360v6-status' 查看部署状态"
 exit 0
