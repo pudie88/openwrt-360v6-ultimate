@@ -1,23 +1,28 @@
 #!/bin/sh
-# 96-install-extras [v3]
+# 96-install-extras [v4]
 # 适用：360 V6 / 小米 CR660x / IPQ6000 (128M Flash / ImmortalWrt / busybox ash)
 #
-# v3 修复清单（相对 v2）：
-#   1. [关键] mmcblk 设备名截断错误：sed 's|[0-9]*$||' 会把 mmcblk0p1 → mmcblk
-#             修复：先去 p[0-9]+，再去末尾数字，得到正确的 mmcblk0
-#   2. [关键] self-heal 在 U 盘重插后找不到挂载点（日志证实 14:20–18:10 无效循环）
-#             原因：sdb1 重插后 block 未自动挂载到 /mnt/sdb1
+# v4 修复清单（相对 v3）：
+#   1. [关键] _block_base() sed 正则在 busybox ash 下对 mmcblk0p1 的截断仍不可靠
+#             （s|p[0-9]*$|| 匹配最后一段，但 s|[0-9]*$|| 再次截去 mmcblk 末尾的 0）
+#             修复：改用 case 分派，sda1→sda / mmcblk0p1→mmcblk0，无歧义
+#   2. [关键] 部分完成重启后 init.d 服务无法自启：dockerd/adguardhome 的
+#             start_service 只检查 install-usb-done，未检查各自的 done 文件；
+#             docker-done 不存在时 docker-bin/dockerd 路径读自旧 mount 文件可能为空
+#             修复：start_service 增加 docker-done / agh-done 二次检查，
+#             done 文件不存在则 return 0（静默跳过），避免以错误路径启动
+#
+# v3 修复清单（相对 v2，继承）：
+#   3. [关键] self-heal 在 U 盘重插后找不到挂载点（日志证实 14:20–18:10 无效循环）
 #             修复：self-heal 找不到挂载点时主动调用 block mount 并重试一次
-#   3. [关键] AGH start_service 内部阻塞 procd：轮询循环阻塞了 procd init 脚本
+#   4. [关键] AGH start_service 内部阻塞 procd
 #             修复：将轮询后台化（子 shell &），start_service 快速返回
-#   4. [关键] avahi-daemon 崩溃循环：dbus 在 avahi 包尚未安装时就 reload，
-#             avahi-dbus.conf 写入时间早于 avahi 用户存在
-#             修复：dbus stop/start 移到 avahi 相关包安装之后
-#   5. [中等] Docker 下载无大小验证：wget 超时可能产生残留小文件通过 mv 落盘
-#             修复：mv 前检查文件大小 > 5MB，否则视为无效删除
-#   6. [中等] self-heal 部分成功后 phase2-failures 计数因 U 盘重插挂载点变化
-#             导致 exec 路径找不到挂载 → 静默退出 → 计数不再递增 → 永不停止
-#             修复：结合修复2（block mount）确保挂载点可发现
+#   5. [关键] avahi-daemon 崩溃循环
+#             修复：dbus stop/start 移到 avahi 相关包安装之后，加 id avahi 检查
+#   6. [中等] Docker 下载无大小验证
+#             修复：mv 前检查文件大小 > 5MB
+#   7. [中等] self-heal 部分成功后 U 盘重插挂载点变化导致永不停止
+#             修复：结合修复3（block mount）确保挂载点可发现
 
 _STATE_DIR="/etc/install-state"
 mkdir -p "$_STATE_DIR" /usr/lib/install-extras /usr/bin \
@@ -130,9 +135,26 @@ _is_usb_dev() {
     esac
 }
 
-# [修复1] 正确提取块设备基名：mmcblk0p1 → mmcblk0，sda1 → sda
+# [修复1/v4] case 分派提取块设备基名，无歧义：
+#   /dev/sda1       → sda
+#   /dev/mmcblk0p1  → mmcblk0
+#   其他            → 原样去掉 /dev/ 前缀（保守兜底）
 _block_base() {
-    echo "$1" | sed 's|/dev/||;s|p[0-9]*$||;s|[0-9]*$||'
+    case "$1" in
+        /dev/mmcblk[0-9]*p[0-9]*)
+            # mmcblk0p1 → mmcblk0：去掉 /dev/，再去掉末尾 p+数字
+            _bb="${1#/dev/}"
+            echo "${_bb%p*}"
+            ;;
+        /dev/sd[a-z][0-9]*)
+            # sda1 → sda：去掉 /dev/，再去掉末尾数字
+            _bb="${1#/dev/}"
+            echo "${_bb%%[0-9]*}"
+            ;;
+        *)
+            echo "${1#/dev/}"
+            ;;
+    esac
 }
 
 mkdir -p "$_SD"
@@ -247,7 +269,7 @@ rm -f "$__wtest"
 printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > /etc/resolv.conf
 log "临时 DNS 已注入"
 
-# [修复1] 使用 _block_base() 正确获取 mmcblk0p1 → mmcblk0
+# [修复1/v4] 使用 _block_base() 正确获取块设备基名
 __udev=$(_block_base "$__dev")
 __sched="/sys/block/${__udev}/queue/scheduler"
 if [ -f "$__sched" ]; then
@@ -408,7 +430,10 @@ DOCKEREOF
 #!/bin/sh /etc/rc.common
 START=99; STOP=10; USE_PROCD=1
 start_service() {
+    # [修复2/v4] 双重检查：install-usb-done 确认 Phase2 整体完成；
+    # docker-done 确认 Docker 组件本身已成功安装（部分完成场景下缺一不可）
     [ -f /etc/install-usb-done ] || return 0
+    [ -f /etc/install-state/docker-done ] || return 0
     _mp=$(cat /etc/install-usb-mount 2>/dev/null)
     [ -n "$_mp" ] && [ -f "$_mp/docker-bin/dockerd" ] || return 1
     grep -q "^[^ ]* /sys/fs/cgroup " /proc/mounts 2>/dev/null \
@@ -507,7 +532,10 @@ _agh_dns_restore() {
 }
 
 start_service() {
+    # [修复2/v4] 双重检查：install-usb-done 确认 Phase2 整体完成；
+    # agh-done 确认 AGH 组件本身已成功安装（部分完成场景下缺一不可）
     [ -f /etc/install-usb-done ] || return 0
+    [ -f /etc/install-state/agh-done ] || return 0
     _mp=$(cat /etc/install-usb-mount 2>/dev/null)
     [ -f "$_mp/adguardhome-bin/AdGuardHome" ] || return 1
     _config="$_mp/AdGuardHome/config/AdGuardHome.yaml"
