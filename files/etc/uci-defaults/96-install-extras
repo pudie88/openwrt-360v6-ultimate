@@ -146,12 +146,14 @@ if [ "$__self_heal" -eq 1 ]; then
     [ -f "$_DONE" ] && exit 0
     __sf=$(cat "$_SD/phase2-failures" 2>/dev/null || echo 0)
     [ "${__sf:-0}" -ge 3 ] && exit 0
+    # 锁文件检查：防止 cron 每 5 分钟重复触发
     if [ -f "$_LOCK" ]; then
         __lp=$(cat "$_LOCK" 2>/dev/null)
         kill -0 "$__lp" 2>/dev/null && exit 0
         rm -f "$_LOCK"
     fi
     for _mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
+        # exec 替换进程；不加 --self-heal 走正常路径，失败计数由正常路径写入
         _is_mounted "$_mp" && { log "自愈触发: $_mp"; exec /usr/lib/install-extras/install-usb.sh "$_mp"; }
     done
     exit 0
@@ -162,7 +164,9 @@ fi
 __dns_old=$(cat /etc/resolv.conf 2>/dev/null)
 [ -z "$__dns_old" ] && __dns_old="nameserver 127.0.0.1"
 _dns_restore() {
-    printf '%s' "$__dns_old" > /etc/resolv.conf
+    # 同步写入后再 reload，避免进程退出过快导致下一进程读到旧内容
+    printf '%s\n' "$__dns_old" > /etc/resolv.conf
+    sync 2>/dev/null || true
     /etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
 }
 trap 'rm -f "$_LOCK"; _dns_restore' EXIT INT TERM
@@ -298,14 +302,13 @@ log "--- Docker 部署 ---"
 __fs_type=$(awk -v mp="$_USB" '$2==mp {print $3; exit}' /proc/mounts 2>/dev/null)
 case "$__fs_type" in
     ext4) ;;
-    ext[23]|f2fs) log "⚠ 文件系统: $__fs_type（建议 ext4）" ;;
     *)
+        # f2fs/ext2/ext3/vfat/ntfs 均不支持 overlay2，统一走格式化或报错路径
         if [ "$__force" -eq 1 ]; then
-            log "⚠ 自动格式化 $__dev 为 ext4..."
+            log "⚠ 文件系统 ${__fs_type:-未知} 不支持 overlay2，自动格式化 $__dev 为 ext4..."
             umount "$_USB" 2>/dev/null
             if mkfs.ext4 -F "$__dev" >/dev/null 2>&1 && mount "$__dev" "$_USB"; then
                 log "格式化并重新挂载完成"
-                # 格式化后重建必要目录
                 mkdir -p "$__dl_dir"
                 __fs_type="ext4"
             else
@@ -422,13 +425,15 @@ if [ "$_AGH_FAIL" -eq 0 ] && [ -f "$__atgz" ]; then
     tar -xzf "$__atgz" -C "$__abin" --strip-components=2 \
         AdGuardHome/AdGuardHome 2>/dev/null
     if [ ! -f "$__abin/AdGuardHome" ]; then
-        # 兼容旧版 tar 不支持 --strip+路径，回退方案
-        tar -xzf "$__atgz" -C "$__abin" 2>/dev/null
-        __found=$(find "$__abin" -name "AdGuardHome" -type f 2>/dev/null | head -1)
-        if [ -n "$__found" ] && [ "$__found" != "$__abin/AdGuardHome" ]; then
+        # 兼容旧版 tar 不支持 --strip+路径，回退：解压到临时子目录再 mv
+        __atmp="$__abin/.extract-$$"
+        mkdir -p "$__atmp"
+        tar -xzf "$__atgz" -C "$__atmp" 2>/dev/null
+        __found=$(find "$__atmp" -name "AdGuardHome" -type f 2>/dev/null | head -1)
+        if [ -n "$__found" ]; then
             mv "$__found" "$__abin/AdGuardHome"
-            rm -rf "$__abin/AdGuardHome" 2>/dev/null   # 清理可能残留的同名目录
         fi
+        rm -rf "$__atmp"   # 只清理临时目录，不碰 $__abin/AdGuardHome
     fi
     if [ ! -f "$__abin/AdGuardHome" ]; then
         log "AGH 二进制提取失败"
@@ -451,16 +456,23 @@ if [ "$_AGH_FAIL" -eq 0 ]; then
     cat > /etc/init.d/adguardhome << 'AINITEOF'
 #!/bin/sh /etc/rc.common
 START=98; STOP=10; USE_PROCD=1
+
+_agh_dns_disable() {
+    uci set dhcp.@dnsmasq[0].port='0' 2>/dev/null
+    uci commit dhcp 2>/dev/null
+    /etc/init.d/dnsmasq reload >/dev/null 2>&1
+}
+_agh_dns_restore() {
+    uci set dhcp.@dnsmasq[0].port='53' 2>/dev/null
+    uci commit dhcp 2>/dev/null
+    /etc/init.d/dnsmasq reload >/dev/null 2>&1
+}
+
 start_service() {
     [ -f /etc/install-usb-done ] || return 0
     _mp=$(cat /etc/install-usb-mount 2>/dev/null)
     [ -f "$_mp/adguardhome-bin/AdGuardHome" ] || return 1
     _config="$_mp/AdGuardHome/config/AdGuardHome.yaml"
-    if [ -f "$_config" ]; then
-        uci set dhcp.@dnsmasq[0].port='0' 2>/dev/null
-        uci commit dhcp 2>/dev/null
-        /etc/init.d/dnsmasq reload >/dev/null 2>&1
-    fi
     procd_open_instance
     procd_set_param command "$_mp/adguardhome-bin/AdGuardHome" \
         ${_config:+--config "$_config"} \
@@ -470,12 +482,12 @@ start_service() {
     procd_set_param stderr 1
     procd_set_param respawn 3600 5 0
     procd_close_instance
+    # 在 procd 接管后才禁用 dnsmasq，进程起不来时 stop_service 会恢复
+    [ -f "$_config" ] && _agh_dns_disable
 }
 stop_service() {
     pkill AdGuardHome 2>/dev/null || true
-    uci set dhcp.@dnsmasq[0].port='53' 2>/dev/null
-    uci commit dhcp 2>/dev/null
-    /etc/init.d/dnsmasq reload >/dev/null 2>&1
+    _agh_dns_restore
 }
 AINITEOF
     chmod +x /etc/init.d/adguardhome
@@ -529,7 +541,8 @@ __dns_old=$(cat /etc/resolv.conf 2>/dev/null)
 [ -z "$__dns_old" ] && __dns_old="nameserver 127.0.0.1"
 _dns_restore() {
     rm -f "$_LOCK"
-    printf '%s' "$__dns_old" > /etc/resolv.conf
+    printf '%s\n' "$__dns_old" > /etc/resolv.conf
+    sync 2>/dev/null || true
     /etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
 }
 trap '_dns_restore' EXIT INT TERM
@@ -803,6 +816,29 @@ rm -f /etc/hotplug.d/block/97-usb-protect
 # 清理 cron
 sed -i '/install-usb.sh/d' /etc/crontabs/root 2>/dev/null || true
 /etc/init.d/cron reload 2>/dev/null || true
+
+# 询问是否清理 U 盘数据
+_mp=$(cat /etc/install-usb-mount 2>/dev/null)
+if [ -n "$_mp" ] && grep -q "^[^ ]* $_mp " /proc/mounts 2>/dev/null; then
+    echo ""
+    echo "U 盘挂载于 $_mp，以下目录占用空间："
+    du -sh "$_mp/docker-bin"      2>/dev/null
+    du -sh "$_mp/docker-data"     2>/dev/null
+    du -sh "$_mp/adguardhome-bin" 2>/dev/null
+    du -sh "$_mp/AdGuardHome"     2>/dev/null
+    du -sh "$_mp/.downloads"      2>/dev/null
+    du -sh "$_mp/swapfile"        2>/dev/null
+    printf "是否删除以上 U 盘数据？[y/N] "; read -r _cu
+    if [ "$_cu" = "y" ] || [ "$_cu" = "Y" ]; then
+        swapoff "$_mp/swapfile" 2>/dev/null || true
+        rm -rf "$_mp/docker-bin" "$_mp/docker-data" \
+               "$_mp/adguardhome-bin" "$_mp/AdGuardHome" \
+               "$_mp/.downloads" "$_mp/swapfile"
+        echo "U 盘数据已清理"
+    else
+        echo "U 盘数据已保留"
+    fi
+fi
 
 # 最后移除自身
 rm -f /usr/bin/360v6-uninstall
