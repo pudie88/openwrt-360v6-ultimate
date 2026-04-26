@@ -135,20 +135,25 @@ if [ "$__self_heal" -eq 1 ]; then
     [ -f "$_DONE" ] && exit 0
     __sf=$(cat "$_SD/phase2-failures" 2>/dev/null || echo 0)
     [ "${__sf:-0}" -ge 3 ] && exit 0
-    # 检查残留锁
+    # 检查主锁：若 install-usb.sh 正在运行则跳过
     if [ -f "$_LOCK" ]; then
         __lp=$(cat "$_LOCK" 2>/dev/null)
-        kill -0 "$__lp" 2>/dev/null && exit 0
+        if kill -0 "$__lp" 2>/dev/null; then
+            # 真正在运行，跳过
+            exit 0
+        fi
+        # 残留锁（进程已死），清理后继续
         log "清理残留锁 (旧pid=$__lp)"; rm -f "$_LOCK"
     fi
     for _mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
         _is_mounted "$_mp" && {
             log "自愈触发: $_mp"
-            # 先写锁再调用，消除并发竞争窗口
-            # 同步调用（不用 &）：自愈本身就在 cron 后台，无需再后台
-            echo $$ > "$_LOCK"
-            /usr/lib/install-extras/install-usb.sh "$_mp"
-            exit 0
+            # exec 替换当前进程：install-usb.sh 继承本进程 PID，
+            # 它自己写锁（echo $$ > $_LOCK）时 $$ 就是本进程 PID，
+            # 锁检查 kill -0 $$ 会成功（install-usb.sh 自身还活着），
+            # 不存在 cron 父进程与子进程的 PID 混淆问题。
+            # 自愈不传 --force：尊重失败计数，由用户手动 --force 重置
+            exec /usr/lib/install-extras/install-usb.sh "$_mp"
         }
     done
     exit 0
