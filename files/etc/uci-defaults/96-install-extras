@@ -1,5 +1,5 @@
 #!/bin/sh
-# 96-install-extras [v10 - Bug Fix]
+# 96-install-extras [v11 - Bug Fix]
 # 适用：360 V6 / 小米 CR660x / IPQ6000 (128M Flash / ImmortalWrt / busybox ash)
 #
 # 架构：
@@ -86,7 +86,8 @@ pgrep AdGuardHome >/dev/null 2>&1 \
     && echo "[OK] AdGuardHome : 运行中" || echo "[--] AdGuardHome : 未启动"
 echo ""
 echo "重跑基础: rm -f /etc/install-extras-done $_SD/phase1-failures && /usr/lib/install-extras/run.sh"
-echo "重跑重型: rm -f /etc/install-usb-done   $_SD/phase2-failures && /usr/lib/install-extras/install-usb.sh --force"
+echo "重跑重型: rm -f /etc/install-usb-done && /usr/lib/install-extras/install-usb.sh --force"
+echo "  （--force 会自动清零失败计数，无需手动删 phase2-failures）"
 echo "健康检查: 360v6-health [--fix]"
 STATUSEOF
 chmod +x /usr/bin/360v6-status
@@ -103,8 +104,11 @@ _LOCK="/tmp/install-usb.lock"
 _SD="/etc/install-state"
 _MF="/etc/install-usb-mount"
 
-# Docker 版本候选（按优先级，定期更新）
-_DOCKER_VERS="28.1.0 28.0.4 28.0.3 27.5.1 27.5.0"
+# Docker 版本候选（实测 aarch64 目录真实存在的版本，降序排列）
+# 来源：https://download.docker.com/linux/static/stable/aarch64/
+# 不用 --spider 探测：wget --spider 在部分网络返回 exit 8（协议错误）
+# 改为直接按序尝试下载，成功即止
+_DOCKER_VERS="28.0.4 28.0.3 27.5.1 27.5.0 27.4.1"
 _DOCKER_BASE="https://download.docker.com/linux/static/stable/aarch64"
 _AGH_URL="https://static.adguard.com/adguardhome/release/AdGuardHome_linux_arm64.tar.gz"
 
@@ -175,6 +179,8 @@ __dns_old=$(cat /etc/resolv.conf 2>/dev/null)
 [ -z "$__dns_old" ] && __dns_old="nameserver 127.0.0.1"
 _dns_restore() {
     printf '%s' "$__dns_old" > /etc/resolv.conf
+    # 重启 dnsmasq 使其重读 resolv.conf，与 run.sh 行为一致
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
 }
 trap 'rm -f "$_LOCK"; _dns_restore' EXIT INT TERM
 
@@ -291,49 +297,56 @@ __dl_dir="$_USB/.downloads"; mkdir -p "$__dl_dir"
 _DOCKER_FAIL=0
 log "--- Docker 部署开始 ---"
 
-# 找最新可用版本（--spider 加 10s 超时，避免版本探测阻塞）
+# 按序尝试下载各版本，成功即止（不用 --spider，在部分网络环境不可靠）
 __docker_ver=""
+__dtgz=""
+__dbin="$_USB/docker-bin"
+__ddata="$_USB/docker-data"
+mkdir -p "$__dbin" "$__ddata" /etc/docker
+
 for _dv in $_DOCKER_VERS; do
-    wget -q --timeout=10 --tries=1 --spider \
-        "$_DOCKER_BASE/docker-${_dv}.tgz" 2>/dev/null \
-        && { __docker_ver="$_dv"; break; }
+    __dtgz_try="$__dl_dir/docker-${_dv}.tgz"
+    # 已有完整缓存则直接使用
+    if [ -f "$__dtgz_try" ]; then
+        if tar -tzf "$__dtgz_try" >/dev/null 2>&1; then
+            log "使用缓存: docker-${_dv}.tgz"
+            __docker_ver="$_dv"; __dtgz="$__dtgz_try"; break
+        else
+            log "缓存损坏，删除: docker-${_dv}.tgz"
+            rm -f "$__dtgz_try"
+        fi
+    fi
+    # 尝试下载
+    log "尝试 Docker ${_dv}..."
+    if wget -q --timeout=120 --tries=1 \
+            -O "${__dtgz_try}.tmp" \
+            "$_DOCKER_BASE/docker-${_dv}.tgz" 2>/dev/null \
+        && mv "${__dtgz_try}.tmp" "$__dtgz_try" \
+        && tar -tzf "$__dtgz_try" >/dev/null 2>&1; then
+        log "下载成功: Docker ${_dv}"
+        __docker_ver="$_dv"; __dtgz="$__dtgz_try"; break
+    fi
+    rm -f "${__dtgz_try}.tmp" "$__dtgz_try"
+    log "Docker ${_dv} 不可用，尝试下一版本"
 done
+
 if [ -z "$__docker_ver" ]; then
-    log "无法确定可用 Docker 版本，跳过"
+    log "所有 Docker 版本均下载失败，跳过"
     _DOCKER_FAIL=1
 fi
 
 if [ "$_DOCKER_FAIL" -eq 0 ]; then
-    __dtgz="$__dl_dir/docker-${__docker_ver}.tgz"
-    __dbin="$_USB/docker-bin"
-    __ddata="$_USB/docker-data"
-    mkdir -p "$__dbin" "$__ddata" /etc/docker
-
-    # 已有缓存则跳过下载，但先校验完整性
-    if [ -f "$__dtgz" ]; then
-        if ! tar -tzf "$__dtgz" >/dev/null 2>&1; then
-            log "缓存文件损坏，删除并重新下载: $(basename $__dtgz)"
-            rm -f "$__dtgz"
-        fi
+    log "解压 Docker $__docker_ver..."
+    # docker tgz 结构：docker/<binaries>，一层目录，--strip-components=1 直接得到二进制
+    tar -xzf "$__dtgz" -C "$__dbin" --strip-components=1 2>/dev/null
+    if [ ! -f "$__dbin/dockerd" ]; then
+        log "解压后未找到 dockerd，tgz 结构异常，删除缓存"
+        rm -f "$__dtgz"
+        _DOCKER_FAIL=1
     fi
-    if [ ! -f "$__dtgz" ]; then
-        _download "$_DOCKER_BASE/docker-${__docker_ver}.tgz" \
-                  "$__dtgz" "Docker $__docker_ver" \
-            || { _DOCKER_FAIL=1; rm -f "$__dtgz"; }
-    fi
+fi
 
-    if [ "$_DOCKER_FAIL" -eq 0 ]; then
-        log "解压 Docker $__docker_ver..."
-        # docker tgz 结构：docker/<binaries>，一层目录
-        tar -xzf "$__dtgz" -C "$__dbin" --strip-components=1 2>/dev/null
-        if [ ! -f "$__dbin/dockerd" ]; then
-            log "解压后未找到 dockerd，缓存可能损坏，删除后下次重试"
-            rm -f "$__dtgz"
-            _DOCKER_FAIL=1
-        fi
-    fi
-
-    if [ "$_DOCKER_FAIL" -eq 0 ]; then
+if [ "$_DOCKER_FAIL" -eq 0 ]; then
         # symlink 到系统路径（Flash 只多几个字节）
         for _b in docker dockerd containerd \
                   containerd-shim-runc-v2 ctr runc; do
@@ -582,7 +595,7 @@ if [ "${__fail:-0}" -ge 3 ]; then
     exit 1
 fi
 
-log "v9 基础环境启动"
+log "v11 基础环境启动"
 
 # ── 清理无效软件源 ────────────────────────────────────────
 for _f in /etc/apk/repositories.d/*.list; do
@@ -676,7 +689,9 @@ __inst lsblk
 __inst smartmontools
 __inst fdisk
 
-# ── Samba（Flash >= 64MB 才装，SKIP_LUCI 控制 LuCI 包）──
+# ── Samba（两个独立阈值）────────────────────────────────
+# samba4-server 本体：Flash >= 64MB（安装体积约 50MB）
+# luci-app-samba4 等 LuCI 包：由 __skip_luci（Flash < 25MB）控制
 # 重新读取 Flash（安装基础包后已减少）
 __flash=$(df /overlay 2>/dev/null | awk 'NR==2{print $4}')
 if [ "${__flash:-0}" -ge 65536 ]; then
@@ -971,6 +986,6 @@ chmod +x /etc/hotplug.d/block/97-usb-protect
 # ══════════════════════════════════════════════════════════════
 # 完成（只安装哨兵，不在此处触发 run.sh）
 # ══════════════════════════════════════════════════════════════
-logger -t "install-extras" "v10 哨兵安装完成，等待 WAN 上线触发"
+logger -t "install-extras" "v11 哨兵安装完成，等待 WAN 上线触发"
 logger -t "install-extras" "执行 '360v6-status' 查看状态"
 exit 0
