@@ -1,20 +1,38 @@
 #!/bin/sh
-# 96-install-extras [V3.4 STABLE]
+# 96-install-extras [V3.5 STABLE]
 # 适用：360 V6 / 小米 CR660x / IPQ6000 (128M Flash / ImmortalWrt / busybox ash)
 #
-# V3.4 修复清单（相对 V3.3）：
-#   FIX-V34-A: Docker daemon.json 缺少 "iptables":false，IPQ6000 无 iptables
-#              导致 dockerd 每次启动必然崩溃（bridge driver NAT chain 失败）
-#              修复：daemon.json 加入 "iptables":false
-#   FIX-V34-B: --force 在参数解析前就被 $_DONE 检查拦截，导致 --force 永远无效
-#              修复：将 [ -f "$_DONE" ] 检查移至参数解析循环之后
-#   FIX-V34-C: 重刷固件后 U 盘有旧数据，AGH 二进制已存在时跳过初始化
-#              但旧 adguardhome.yaml 仍被读取导致跳过向导无法重新初始化
-#              修复：检测到旧配置含 users 字段时自动清除
-#   FIX-V34-D: 自定义 init.d 与 apk 安装的 luci-app-adguardhome 冲突
-#              脚本生成的 init.d 会覆盖 apk 的，导致 LuCI 菜单无法控制 AGH
-#              修复：改用 apk 安装 luci-app-adguardhome，通过 UCI 配置路径
-#              不再自行生成 /etc/init.d/adguardhome
+# V3.5 修复清单（相对 V3.4）：
+#   FIX-V35-A: FIX-V34-C 实现缺失——二进制已存在时旧配置含 users 字段应清除
+#              而非仅打日志，修复：检测到旧配置含 users 字段时执行 rm 清除
+#   FIX-V35-B: _dnsmasq_restore EXIT trap 总是回滚——install-usb.sh 生命周期内
+#              $SD/agh-done 由用户手动执行 agh-finalize 写入，脚本内永远不存在
+#              导致每次正常退出都回滚 dnsmasq，AGH 下次启动报 53 端口冲突
+#              修复：增加脚本内部标志变量 _AGH_STARTED，AGH 进程确认启动后置 1
+#              EXIT trap 通过该标志决定是否跳过回滚
+#   FIX-V35-C: _tar_extract 空目录静默返回 0——glob 不展开时循环体从不执行
+#              函数返回 0，调用方误以为成功，实际目标目录为空
+#              修复：循环前置空文件计数器，循环后检测是否有文件被移动
+#   FIX-V35-D: tgz 完整性校验仅靠文件大小——截断 tgz（>5MB 但尾部损坏）或
+#              CDN 错误页面（200 OK + HTML）无法被拦截，导致 tar 解压损坏
+#              修复：下载完成后用 gzip -t 校验完整性，失败则删除重试
+#   FIX-V35-E: agh-finalize 密码明文出现在进程列表（ps aux / /proc/pid/cmdline）
+#              修复：密码参数为空时改为交互式 stty -echo 读取
+#   FIX-V35-F: block hotplug sleep 5 在慢速 U 盘上不足，挂载点未就绪时
+#              静默退出，事件永久丢失
+#              修复：改为最多 24 秒轮询（每 2 秒一次，共 12 次）
+#   FIX-V35-G: dockerd respawn max_failures=0 导致崩溃时无限重启
+#              修复：改为 3600 5 3（最多连续失败 3 次后停止）
+#   FIX-V35-H: DNS 冲突检测通过 UCI 未配置 port 等价为 53，可能误报
+#              修复：改用 netstat 直接检测 dnsmasq 是否占用 53 端口
+#   FIX-V35-I: 360v6-status 中 AGH 统计 JSON 解析不健壮（键值间有空格时失败）
+#              修复：改用 sed 兼容写法
+#   FIX-V35-J: wget 无重试，网络抖动时直接放弃当前版本
+#              修复：用 shell 循环包裹，最多重试 3 次
+#   FIX-V35-K: 360v6-uninstall 在 status 帮助中提示但从未生成
+#              修复：补充生成 360v6-uninstall 工具
+#   FIX-V35-L: overlay2 可用性判断用 modinfo（IPQ6000 上可能不存在）
+#              修复：仅用 /proc/filesystems 判断
 
 _SD="/etc/install-state"
 mkdir -p "$_SD" /usr/lib/install-extras /usr/bin \
@@ -34,7 +52,7 @@ _get_usb_mount() {
 }
 
 # ══════════════════════════════════════════════════════════════
-# 模块 0：360v6-status（V3.4）
+# 模块 0：360v6-status（V3.5）
 # ══════════════════════════════════════════════════════════════
 cat > /usr/bin/360v6-status << 'STATUSEOF'
 #!/bin/sh
@@ -45,7 +63,6 @@ _get_usb_mount() {
     done
     return 1
 }
-_is_mounted() { grep -q "^[^ ]* $1 " /proc/mounts 2>/dev/null; }
 
 _timeout() {
     __tt="$1"; shift
@@ -69,7 +86,7 @@ _timeout() {
 }
 
 echo "=== 360 V6 状态 @ $(date '+%Y-%m-%d %H:%M:%S') ==="
-echo "版本  : V3.4 STABLE"
+echo "版本  : V3.5 STABLE"
 echo ""
 
 if [ -f /etc/install-extras-done ]; then
@@ -85,7 +102,12 @@ if [ -f /etc/install-usb-done ]; then
         echo "     AGH    : OK（已完成初始化）"
         if command -v curl >/dev/null 2>&1; then
             _stats=$(_timeout 3 curl -s http://127.0.0.1:3000/control/stats 2>/dev/null)
-            [ -n "$_stats" ] && echo "     AGH统计: 总查询 $(echo "$_stats" | grep -o '"num_dns_queries":[0-9]*' | cut -d: -f2) 次"
+            if [ -n "$_stats" ]; then
+                # FIX-V35-I: 用 sed 兼容解析，支持键值间有空格的标准 JSON
+                _qcnt=$(echo "$_stats" | sed 's/.*"num_dns_queries":[[:space:]]*\([0-9]*\).*/\1/' \
+                        | grep -E '^[0-9]+$')
+                [ -n "$_qcnt" ] && echo "     AGH统计: 总查询 ${_qcnt} 次"
+            fi
         fi
     elif pgrep -f "AdGuardHome" >/dev/null 2>&1; then
         echo "     AGH    : 运行中（等待初始化向导）"
@@ -126,11 +148,10 @@ echo "AGH 管理: http://192.168.2.1:3000"
 echo "健康检查: 360v6-health [--fix]"
 echo "卸载    : 360v6-uninstall"
 STATUSEOF
-
 chmod +x /usr/bin/360v6-status
 
 # ══════════════════════════════════════════════════════════════
-# 模块 0b：360v6-health（V3.4）
+# 模块 0b：360v6-health（V3.5）
 # ══════════════════════════════════════════════════════════════
 cat > /usr/bin/360v6-health << 'HEALTHEOF'
 #!/bin/sh
@@ -200,15 +221,17 @@ else
 fi
 
 # 5. DNS 冲突检测
-_dnsmasq_port=$(uci get dhcp.@dnsmasq[0].port 2>/dev/null)
+# FIX-V35-H: 改用 netstat 直接检测 dnsmasq 是否实际占用 53 端口
+# UCI 未配置 port 不等于 dnsmasq 一定在监听 53，避免误报
 if [ -f "$_SD/agh-done" ]; then
-    if [ "${_dnsmasq_port:-53}" != "0" ]; then
-        _err "DNS 冲突：AGH 已 finalize 但 dnsmasq 仍监听（port=${_dnsmasq_port:-53}）"
+    _dnsmasq_on_53=$(netstat -lnup 2>/dev/null | awk '$4 ~ /:53$/ && $NF ~ /dnsmasq/{print 1; exit}')
+    if [ "${_dnsmasq_on_53}" = "1" ]; then
+        _err "DNS 冲突：AGH 已 finalize 但 dnsmasq 仍监听 53 端口"
         _fix "禁用 dnsmasq DNS 端口" \
             "uci set dhcp.@dnsmasq[0].port='0'; uci commit dhcp; /etc/init.d/dnsmasq reload"
         _errs=$((_errs+1))
     else
-        _ok "DNS 分配正常（dnsmasq DNS 已禁用，AGH 接管）"
+        _ok "DNS 分配正常（dnsmasq 未占用 53 端口，AGH 接管）"
     fi
 else
     _ok "DNS 分配正常（dnsmasq 提供 DNS，AGH 向导未完成）"
@@ -250,7 +273,74 @@ HEALTHEOF
 chmod +x /usr/bin/360v6-health
 
 # ══════════════════════════════════════════════════════════════
-# 模块 A：install-usb.sh（Phase 2 - V3.4）
+# 模块 0c：360v6-uninstall（V3.5 新增，FIX-V35-K）
+# ══════════════════════════════════════════════════════════════
+cat > /usr/bin/360v6-uninstall << 'UNINSTEOF'
+#!/bin/sh
+# 360v6-uninstall：完整卸载 install-extras 部署的所有组件
+# 用法：360v6-uninstall [--yes]
+_SD="/etc/install-state"
+
+_confirm() {
+    [ "$1" = "--yes" ] && return 0
+    printf "此操作将停止 Docker 和 AdGuardHome，删除所有状态标记。继续？[y/N] "
+    read _ans
+    case "$_ans" in y|Y) return 0 ;; *) echo "已取消"; exit 0 ;; esac
+}
+_confirm "$1"
+
+echo "[1/7] 停止 AdGuardHome..."
+/etc/init.d/adguardhome stop 2>/dev/null
+/etc/init.d/adguardhome disable 2>/dev/null
+pkill -f AdGuardHome 2>/dev/null
+sleep 2
+
+echo "[2/7] 停止 Docker..."
+/etc/init.d/dockerd stop 2>/dev/null
+/etc/init.d/dockerd disable 2>/dev/null
+pkill dockerd 2>/dev/null
+pkill containerd 2>/dev/null
+sleep 2
+
+echo "[3/7] 恢复 dnsmasq DNS 端口..."
+_cur=$(uci get dhcp.@dnsmasq[0].port 2>/dev/null)
+if [ "${_cur}" = "0" ]; then
+    uci delete dhcp.@dnsmasq[0].port 2>/dev/null
+    uci commit dhcp 2>/dev/null
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1
+    echo "     dnsmasq DNS 端口已恢复"
+fi
+
+echo "[4/7] 删除符号链接和工具..."
+for _b in docker dockerd containerd containerd-shim-runc-v2 ctr runc docker-proxy docker-init; do
+    [ -L "/usr/bin/$_b" ] && rm -f "/usr/bin/$_b"
+done
+rm -f /usr/bin/AdGuardHome /usr/bin/agh-finalize
+
+echo "[5/7] 删除 init.d 脚本..."
+rm -f /etc/init.d/dockerd
+
+echo "[6/7] 删除状态标记..."
+rm -f /etc/install-extras-done /etc/install-usb-done /etc/install-usb-mount
+rm -f "$_SD/docker-done" "$_SD/agh-done"
+rm -f "$_SD/docker-failures" "$_SD/agh-failures" "$_SD/phase1-failures"
+rm -f "$_SD/last-self-heal"
+rm -f /etc/docker/daemon.json
+rm -f /etc/adguardhome.yaml /etc/adguardhome/adguardhome.yaml
+rm -f /etc/config/dhcp.agh-backup
+
+echo "[7/7] 删除 hotplug 脚本..."
+rm -f /etc/hotplug.d/iface/96-install-extras
+rm -f /etc/hotplug.d/block/96-install-usb
+
+echo ""
+echo "卸载完成。U 盘上的数据（Docker 镜像、AGH 数据）未删除。"
+echo "如需彻底清理，请手动删除 U 盘上的 docker-bin/ docker-data/ adguardhome-bin/ AdGuardHome/ swapfile"
+UNINSTEOF
+chmod +x /usr/bin/360v6-uninstall
+
+# ══════════════════════════════════════════════════════════════
+# 模块 A：install-usb.sh（Phase 2 - V3.5）
 # ══════════════════════════════════════════════════════════════
 cat > /usr/lib/install-extras/install-usb.sh << 'USBEOF'
 #!/bin/sh
@@ -302,6 +392,7 @@ _timeout() {
     return $__tr
 }
 
+# FIX-V35-C: 增加文件计数检测，空目录时返回失败而非静默成功
 _tar_extract() {
     __tgz="$1"; __dst="$2"; __subdir="$3"
     __tmp="${__dst}.xtmp$$"
@@ -312,15 +403,39 @@ _tar_extract() {
     else
         __src="$__tmp"
     fi
+    __moved=0
     for __f in "$__src/"*; do
         [ -e "$__f" ] || continue
         __bn="${__f##*/}"
         [ -d "$__dst/$__bn" ] && rm -rf "$__dst/$__bn"
         [ -f "$__dst/$__bn" ] && rm -f "$__dst/$__bn"
-        mv "$__f" "$__dst/" 2>/dev/null || { rm -rf "$__tmp"; return 1; }
+        mv "$__f" "$__dst/" 2>/dev/null || { rm -rf "$__tmp"; log "tar mv 失败: $__f"; return 1; }
+        __moved=$((__moved + 1))
     done
     rm -rf "$__tmp"
+    if [ "$__moved" -eq 0 ]; then
+        log "tar 解压结果为空（目录结构与预期不符）: $__tgz"
+        return 1
+    fi
     return 0
+}
+
+# FIX-V35-J: wget 带重试，最多 3 次，间隔 3 秒
+_wget_retry() {
+    __url="$1"; __out="$2"; __min_size="${3:-0}"
+    __r=0
+    while [ "$__r" -lt 3 ]; do
+        wget -q --timeout=120 -O "$__out" "$__url" 2>/dev/null
+        __sz=$(wc -c < "$__out" 2>/dev/null || echo 0)
+        if [ "${__sz:-0}" -ge "$__min_size" ] && [ "${__sz:-0}" -gt 0 ]; then
+            return 0
+        fi
+        rm -f "$__out"
+        __r=$((__r + 1))
+        [ "$__r" -lt 3 ] && { log "下载失败，${__r}/3，等待 3 秒重试..."; sleep 3; }
+    done
+    log "下载失败（已重试 3 次）: $__url"
+    return 1
 }
 
 mkdir -p "$_SD"
@@ -364,12 +479,11 @@ if [ "$__self_heal" -eq 1 ]; then
     exit 0
 fi
 
-# FIX-V34-B: --force 清理在 $_DONE 检查之前执行
+# --force 清理在 $_DONE 检查之前执行（FIX-V34-B 保留）
 if [ "$__force" -eq 1 ]; then
     rm -f "$_DONE"
     rm -f "$_SD/docker-failures" "$_SD/agh-failures" "$_SD/docker-done" "$_SD/agh-done"
-    rm -f /etc/adguardhome.yaml
-    rm -f /etc/adguardhome/adguardhome.yaml
+    rm -f /etc/adguardhome.yaml /etc/adguardhome/adguardhome.yaml
     log "--force：失败计数、组件标记及 AGH 配置已清零"
 fi
 
@@ -379,6 +493,9 @@ fi
 __dns_old=$(cat /etc/resolv.conf 2>/dev/null)
 [ -z "$__dns_old" ] && __dns_old="nameserver 127.0.0.1"
 
+# FIX-V35-B: 增加 _AGH_STARTED 标志，控制 EXIT trap 是否跳过 dnsmasq 回滚
+_AGH_STARTED=0
+
 _dns_restore() {
     rm -f "$_LOCK"
     printf '%s\n' "$__dns_old" > /etc/resolv.conf 2>/dev/null
@@ -386,8 +503,10 @@ _dns_restore() {
 }
 
 _dnsmasq_restore() {
-    if [ -f "$_SD/agh-done" ]; then
-        log "AGH 已 finalize，跳过 dnsmasq 回滚"
+    # AGH 进程已成功启动时跳过回滚，让 AGH 维持对 DNS 的临时控制
+    # 用户执行 agh-finalize 后才正式接管，此时无需回滚 dnsmasq
+    if [ "$_AGH_STARTED" -eq 1 ]; then
+        log "AGH 进程已启动，跳过 dnsmasq 回滚（执行 agh-finalize 完成接管）"
         return 0
     fi
     if [ -f "$_DNSMASQ_BACKUP" ]; then
@@ -484,11 +603,15 @@ else
         __dtgz="$__dl_dir/docker-${_dv}.tgz"
         if [ ! -f "$__dtgz" ]; then
             log "下载 Docker ${_dv}..."
-            wget -q --timeout=180 -O "${__dtgz}.tmp" "$_DOCKER_BASE/docker-${_dv}.tgz" 2>/dev/null
-            __tsz=$(wc -c < "${__dtgz}.tmp" 2>/dev/null || echo 0)
-            if [ "${__tsz:-0}" -lt 5242880 ]; then
+            # FIX-V35-J: 使用带重试的 _wget_retry，最小文件大小 5MB
+            if ! _wget_retry "$_DOCKER_BASE/docker-${_dv}.tgz" "${__dtgz}.tmp" 5242880; then
+                log "Docker ${_dv} 下载失败，尝试下一版本"
+                continue
+            fi
+            # FIX-V35-D: 校验 tgz 完整性，拦截截断文件和错误页面
+            if ! gzip -t "${__dtgz}.tmp" 2>/dev/null; then
+                log "Docker ${_dv} tgz 完整性校验失败，删除"
                 rm -f "${__dtgz}.tmp"
-                log "Docker ${_dv} 下载失败或文件过小，尝试下一版本"
                 continue
             fi
             mv "${__dtgz}.tmp" "$__dtgz"
@@ -500,7 +623,7 @@ else
                 __docker_ver="$_dv"
                 break
             else
-                log "Docker ${_dv} tgz 结构异常，删除缓存"
+                log "Docker ${_dv} tgz 结构异常（未找到 dockerd），删除缓存"
                 rm -f "$__dtgz"
             fi
         else
@@ -514,14 +637,15 @@ else
             [ -f "$__dbin/$_b" ] && ln -sf "$__dbin/$_b" "/usr/bin/$_b" 2>/dev/null
         done
 
-        # 检测 overlay2 可用性
+        # FIX-V35-L: 仅用 /proc/filesystems 检测 overlay2 可用性
+        # 不依赖 modinfo（IPQ6000 上可能不存在）
         __storage_driver="overlay2"
-        if ! modinfo overlay >/dev/null 2>&1 && ! grep -q overlay /proc/filesystems 2>/dev/null; then
-            log "overlay2 模块不可用，降级使用 vfs"
+        if ! grep -q "^overlay$" /proc/filesystems 2>/dev/null; then
+            log "overlay 文件系统不可用，降级使用 vfs"
             __storage_driver="vfs"
         fi
 
-        # FIX-V34-A: 加入 "iptables":false，IPQ6000 无 iptables 时避免 bridge driver 崩溃
+        # FIX-V34-A 保留: 加入 "iptables":false
         cat > /etc/docker/daemon.json << DOCKEREOF
 {
   "data-root": "$__ddata",
@@ -546,7 +670,9 @@ start_service() {
     fi
     procd_open_instance
     procd_set_param command "$_mp/docker-bin/dockerd" --config-file /etc/docker/daemon.json
-    procd_set_param stdout 1; procd_set_param stderr 1; procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1; procd_set_param stderr 1
+    # FIX-V35-G: max_failures 改为 3，避免崩溃时无限重启
+    procd_set_param respawn 3600 5 3
     procd_close_instance
 }
 stop_service() { pkill dockerd 2>/dev/null || true; pkill containerd 2>/dev/null || true; }
@@ -568,7 +694,7 @@ DINITEOF
     fi
 fi
 
-# ══ AdGuardHome 部署（V3.4）══════════════════════════════════
+# ══ AdGuardHome 部署（V3.5）══════════════════════════════════
 _AGH_FAIL=0
 log "--- AdGuardHome 部署 ---"
 
@@ -586,14 +712,19 @@ else
     if [ ! -f "$__abin/AdGuardHome" ]; then
         if [ ! -f "$__atgz" ]; then
             log "下载 AdGuardHome..."
-            wget -q --timeout=180 -O "${__atgz}.tmp" "$_AGH_URL" 2>/dev/null
-            __asz=$(wc -c < "${__atgz}.tmp" 2>/dev/null || echo 0)
-            if [ "${__asz:-0}" -lt 10485760 ]; then
-                rm -f "${__atgz}.tmp"
-                log "AGH 下载失败或文件过小（${__asz}B < 10MB）"
+            # FIX-V35-J: 使用带重试的 _wget_retry，最小文件大小 10MB
+            if ! _wget_retry "$_AGH_URL" "${__atgz}.tmp" 10485760; then
+                log "AGH 下载失败"
                 _AGH_FAIL=1
             else
-                mv "${__atgz}.tmp" "$__atgz"
+                # FIX-V35-D: 校验 tgz 完整性
+                if ! gzip -t "${__atgz}.tmp" 2>/dev/null; then
+                    log "AGH tgz 完整性校验失败，删除"
+                    rm -f "${__atgz}.tmp"
+                    _AGH_FAIL=1
+                else
+                    mv "${__atgz}.tmp" "$__atgz"
+                fi
             fi
         fi
         if [ "$_AGH_FAIL" -eq 0 ] && [ -f "$__atgz" ]; then
@@ -603,7 +734,7 @@ else
                     chmod +x "$__abin/AdGuardHome"
                     log "AdGuardHome 二进制就绪"
                 else
-                    log "AGH tgz 结构异常，删除缓存"
+                    log "AGH tgz 结构异常（未找到 AdGuardHome 二进制），删除缓存"
                     rm -f "$__atgz"
                     _AGH_FAIL=1
                 fi
@@ -614,75 +745,67 @@ else
             fi
         fi
     else
-        # FIX-V34-C: 二进制已存在时检查旧配置，含 users 字段说明向导已完成过
-        # 重刷固件后需要清除旧配置让向导重新出现
+        # FIX-V35-A: 二进制已存在时检查旧配置
+        # 含 users 字段说明向导已在之前某次完成过，重刷固件后需清除旧配置
+        # 让向导重新出现（而非原来仅打日志的错误实现）
         for _yaml in /etc/adguardhome.yaml /etc/adguardhome/adguardhome.yaml; do
             if [ -f "$_yaml" ] && grep -q "^users:" "$_yaml" 2>/dev/null; then
-                # 有旧的完成配置，保留（不清除）
-                log "检测到已完成的 AGH 配置: $_yaml，保留"
+                log "检测到旧配置含 users 字段: $_yaml，清除以允许向导重新出现"
+                rm -f "$_yaml"
             fi
         done
+        log "AdGuardHome 二进制已存在，跳过下载"
     fi
 
     if [ "$_AGH_FAIL" -eq 0 ] && [ -f "$__abin/AdGuardHome" ]; then
-        # 用 U 盘二进制替换或创建 /usr/bin/AdGuardHome
         cp "$__abin/AdGuardHome" /usr/bin/AdGuardHome 2>/dev/null || \
             ln -sf "$__abin/AdGuardHome" /usr/bin/AdGuardHome 2>/dev/null
 
-        # FIX-V34-D: 使用 apk 安装 luci-app-adguardhome，通过 UCI 配置路径
-        # 不再自行生成 /etc/init.d/adguardhome，避免与 LuCI 插件冲突
+        # FIX-V34-D 保留: 使用 apk 安装 luci-app-adguardhome
         log "安装 luci-app-adguardhome..."
-        apk update >/dev/null 2>&1
-        apk add luci-app-adguardhome >/dev/null 2>&1 && \
+        apk update >/dev/null 2>&1 && \
+            apk add luci-app-adguardhome >/dev/null 2>&1 && \
             log "luci-app-adguardhome 安装完成" || \
             log "luci-app-adguardhome 安装失败（源不可用），跳过 LuCI 集成"
 
-        # 配置 AGH 路径（通过 UCI）
         mkdir -p /etc/adguardhome
         uci set adguardhome.config.work_dir="$__adata" 2>/dev/null
         uci set adguardhome.config.enabled='1' 2>/dev/null
         uci commit adguardhome 2>/dev/null
 
-        # 备份 dnsmasq 配置
         if [ ! -f "$_DNSMASQ_BACKUP" ]; then
             cp /etc/config/dhcp "$_DNSMASQ_BACKUP" 2>/dev/null
         fi
 
-        # 启动 AGH
-        /etc/init.d/adguardhome enable 2>/dev/null
-        # 先杀掉可能残留的旧进程，避免 sessions.db 锁冲突
-        pkill -f AdGuardHome 2>/dev/null; sleep 2
-        /etc/init.d/adguardhome start 2>/dev/null
-
-        # 等待进程启动（最多 15 秒）
-        __agh_up=0
-        __wi=0
-        while [ "$__wi" -lt 15 ]; do
-            if pgrep -f "AdGuardHome" >/dev/null 2>&1; then
-                __agh_up=1; break
-            fi
-            sleep 1; __wi=$((__wi + 1))
-        done
-
-        if [ "$__agh_up" -eq 1 ]; then
-            log "AdGuardHome 进程已启动"
-            log ">>> 请访问 http://192.168.2.1:3000 完成初始化向导 <<<"
-            log "    向导完成后执行: agh-finalize <用户名> <密码>"
-
-            # agh-finalize 工具
-            cat > /usr/bin/agh-finalize << 'FINALEOF'
+        # agh-finalize 工具在进程启动检测前生成（FIX-V35 建议）
+        # 确保即使后续流程失败用户也能得到此工具
+        cat > /usr/bin/agh-finalize << 'FINALEOF'
 #!/bin/sh
 # 在 AGH 初始化向导完成后执行此命令，完成 DNS 接管和状态标记
-# 用法：agh-finalize <用户名> <密码>
+# 用法：agh-finalize <用户名> [密码]（密码可省略，省略时交互输入）
 _SD="/etc/install-state"
 _DNSMASQ_BACKUP="/etc/config/dhcp.agh-backup"
 
 _user="${1:-}"
 _pass="${2:-}"
 
-if [ -z "$_user" ] || [ -z "$_pass" ]; then
-    echo "用法: agh-finalize <用户名> <密码>"
-    echo "      用户名和密码为 AGH 向导中设置的管理员账户"
+if [ -z "$_user" ]; then
+    echo "用法: agh-finalize <用户名> [密码]"
+    echo "      密码可省略，省略时将交互式输入（不回显）"
+    exit 1
+fi
+
+# FIX-V35-E: 密码为空时改为交互式输入，避免明文出现在进程列表
+if [ -z "$_pass" ]; then
+    printf "密码: "
+    stty -echo 2>/dev/null
+    read _pass
+    stty echo 2>/dev/null
+    echo ""
+fi
+
+if [ -z "$_pass" ]; then
+    echo "[ERR] 密码不能为空"
     exit 1
 fi
 
@@ -714,21 +837,17 @@ fi
 
 echo "[OK] AGH 登录验证成功（端口 $_agh_port），开始接管 DNS..."
 
-# 禁用 dnsmasq DNS 端口
 uci set dhcp.@dnsmasq[0].port='0' 2>/dev/null
 uci commit dhcp 2>/dev/null
 /etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
 echo "[OK] dnsmasq DNS 端口已禁用"
 
-# 重启 AGH 让它接管 53 端口
 /etc/init.d/adguardhome restart >/dev/null 2>&1 || true
 echo "[OK] AGH 已重启接管 DNS"
 
-# 写入完成标记
 date '+%Y-%m-%d %H:%M:%S' > "$_SD/agh-done"
 echo "[OK] agh-done 标记已写入"
 
-# 注册日志清理 cron（每周日 03:00）
 __cron_job='0 3 * * 0 _MP=$(cat /etc/install-usb-mount 2>/dev/null); [ -n "$_MP" ] && find "$_MP/AdGuardHome/data/logs" -name "*.log" -mtime +30 -delete 2>/dev/null'
 if ! grep -qF "AdGuardHome/data/logs" /etc/crontabs/root 2>/dev/null; then
     echo "$__cron_job" >> /etc/crontabs/root
@@ -739,7 +858,27 @@ fi
 echo "[OK] 完成！AGH 已全面接管 DNS"
 echo "     状态查看: 360v6-status"
 FINALEOF
-            chmod +x /usr/bin/agh-finalize
+        chmod +x /usr/bin/agh-finalize
+
+        /etc/init.d/adguardhome enable 2>/dev/null
+        pkill -f AdGuardHome 2>/dev/null; sleep 2
+        /etc/init.d/adguardhome start 2>/dev/null
+
+        __agh_up=0
+        __wi=0
+        while [ "$__wi" -lt 15 ]; do
+            if pgrep -f "AdGuardHome" >/dev/null 2>&1; then
+                __agh_up=1; break
+            fi
+            sleep 1; __wi=$((__wi + 1))
+        done
+
+        if [ "$__agh_up" -eq 1 ]; then
+            # FIX-V35-B: AGH 进程确认启动，置标志让 EXIT trap 跳过 dnsmasq 回滚
+            _AGH_STARTED=1
+            log "AdGuardHome 进程已启动"
+            log ">>> 请访问 http://192.168.2.1:3000 完成初始化向导 <<<"
+            log "    向导完成后执行: agh-finalize <用户名>"
             rm -f "$_SD/agh-failures"
         else
             log "AdGuardHome 进程启动失败"
@@ -762,7 +901,7 @@ if [ "$_DOCKER_FAIL" -eq 0 ] && [ "$_AGH_FAIL" -eq 0 ]; then
     date '+%Y-%m-%d %H:%M:%S' > "$_DONE"
     log "重型应用完成 [Docker:OK AGH:OK]"
     log ">>> 请访问 http://192.168.2.1:3000 完成 AGH 初始化向导 <<<"
-    log "    向导完成后执行: agh-finalize <用户名> <密码>"
+    log "    向导完成后执行: agh-finalize <用户名>"
     exit 0
 elif [ "$_DOCKER_FAIL" -eq 0 ] || [ "$_AGH_FAIL" -eq 0 ]; then
     log "重型应用部分完成 [Docker:$([ "$_DOCKER_FAIL" -eq 0 ] && echo OK || echo FAIL) AGH:$([ "$_AGH_FAIL" -eq 0 ] && echo OK || echo FAIL)]"
@@ -775,7 +914,7 @@ USBEOF
 chmod +x /usr/lib/install-extras/install-usb.sh
 
 # ══════════════════════════════════════════════════════════════
-# 模块 B：run.sh（Phase 1 - V3.4）
+# 模块 B：run.sh（Phase 1 - V3.5）
 # ══════════════════════════════════════════════════════════════
 cat > /usr/lib/install-extras/run.sh << 'RUNEOF'
 #!/bin/sh
@@ -845,7 +984,9 @@ fi
 RUNEOF
 chmod +x /usr/lib/install-extras/run.sh
 
+# ══════════════════════════════════════════════════════════════
 # WAN hotplug
+# ══════════════════════════════════════════════════════════════
 cat > /etc/hotplug.d/iface/96-install-extras << 'IFACEEOF'
 #!/bin/sh
 [ "${ACTION:-}" = "ifup" ] || exit 0
@@ -855,22 +996,32 @@ case "${INTERFACE:-}" in wan|wan6|pppoe-wan) ;; *) exit 0 ;; esac
 IFACEEOF
 chmod +x /etc/hotplug.d/iface/96-install-extras
 
-# U盘 hotplug
+# ══════════════════════════════════════════════════════════════
+# U盘 hotplug（FIX-V35-F：sleep 5 改为最多 24 秒轮询）
+# ══════════════════════════════════════════════════════════════
 cat > /etc/hotplug.d/block/96-install-usb << 'BLOCKEOF'
 #!/bin/sh
 case "${DEVNAME:-}" in sd[a-z]*|mmcblk[0-9]*) ;; *) exit 0 ;; esac
 [ "${ACTION:-}" = "add" ] || exit 0
 [ -f /etc/install-usb-done ] && exit 0
 [ -f /etc/install-extras-done ] || exit 0
-sleep 5
+
+# FIX-V35-F: 轮询等待挂载点就绪，最多 24 秒（每 2 秒一次，共 12 次）
+# 取代原来固定 sleep 5，避免慢速 U 盘上挂载点未就绪时静默退出
 _mp=""
-for _m in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
-    grep -q "^[^ ]* $_m " /proc/mounts 2>/dev/null && { _mp="$_m"; break; }
+_i=0
+while [ "$_i" -lt 12 ]; do
+    for _m in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
+        grep -q "^[^ ]* $_m " /proc/mounts 2>/dev/null && { _mp="$_m"; break 2; }
+    done
+    sleep 2
+    _i=$((_i + 1))
 done
+
 [ -z "$_mp" ] && exit 1
 /usr/lib/install-extras/install-usb.sh "$_mp" &
 BLOCKEOF
 chmod +x /etc/hotplug.d/block/96-install-usb
 
-logger -t "install-extras" "V3.4 哨兵安装完成，等待 WAN 上线触发"
+logger -t "install-extras" "V3.5 哨兵安装完成，等待 WAN 上线触发"
 exit 0
