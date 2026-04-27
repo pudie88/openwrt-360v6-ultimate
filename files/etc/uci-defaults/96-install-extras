@@ -21,8 +21,9 @@
 #          修复：改为检查 AGH API /control/status 返回 JSON 中 running:true
 #   FIX-I: swapon 后未设置 swappiness，USB 随机写慢导致系统假死
 #          修复：swapon 后立即设置 vm.swappiness=10 及其他内存参数
-#   FIX-J: run.sh 用 apk add 安装包，ImmortalWrt 包管理器是 opkg 非 apk
-#          修复：改为 opkg update && opkg install
+#   FIX-J: run.sh 硬编码包管理器命令，无法兼容新旧版本
+#          修复：自动检测 apk（ImmortalWrt 新版/OpenWrt snapshot）或
+#          opkg（ImmortalWrt 旧版/OpenWrt 23.05），运行时动态选择
 #   FIX-K: install-usb.sh 中裸用 timeout 命令，BusyBox 参数格式可能不同
 #          修复：统一用 _timeout() 封装，自动检测 BusyBox timeout 格式
 #   FIX-L: cgroup2 重复挂载（install 阶段 + init.d 各挂载一次）
@@ -706,10 +707,20 @@ if [ "$__ok" -eq 0 ]; then
     exit 1
 fi
 
-# FIX-J: ImmortalWrt 包管理器是 opkg，不是 apk
-opkg update >/dev/null 2>&1
+# 自动检测包管理器（ImmortalWrt 新版用 apk，旧版/OpenWrt 23.05 用 opkg）
+if command -v apk >/dev/null 2>&1; then
+    _pkg_install() { apk add --no-cache "$@" >/dev/null 2>&1; }
+    log "包管理器: apk"
+elif command -v opkg >/dev/null 2>&1; then
+    _pkg_install() { opkg update >/dev/null 2>&1; opkg install "$@" >/dev/null 2>&1; }
+    log "包管理器: opkg"
+else
+    _pkg_install() { log "无可用包管理器，跳过安装 $*"; return 1; }
+    log "警告：未找到包管理器"
+fi
+
 for __p in bash htop lsblk smartmontools fdisk curl; do
-    opkg install "$__p" >/dev/null 2>&1 && log "已安装: $__p"
+    _pkg_install "$__p" && log "已安装: $__p"
 done
 
 date '+%Y-%m-%d %H:%M:%S' > "$_DONE"
