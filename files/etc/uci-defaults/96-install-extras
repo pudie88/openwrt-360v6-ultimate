@@ -6,7 +6,8 @@
 #   FIX-A: 移除 AGH --pidfile 参数（AGH 不支持，导致进程立即退出）
 #          改用 pgrep 检测进程存活，更可靠
 #   FIX-B: service_started() 是 procd 死代码（procd 从不调用此函数）
-#          将 dnsmasq 禁用逻辑移入 start_service() 内，用后台子进程延迟执行
+#          dnsmasq 禁用移入 start_service()，在 procd_close_instance 后同步执行
+#          （向导完成前不执行，向导完成后 reboot 时先禁再启，消除端口冲突）
 #   FIX-C: trap EXIT 无条件调用 _dnsmasq_restore，破坏已 finalize 的 AGH DNS
 #          修复：_dnsmasq_restore 开头检查 agh-done 标记，已 finalize 则跳过
 #   FIX-D: Docker daemon.json 写死 overlay2，IPQ6000 内核无此模块导致 dockerd 崩溃
@@ -15,10 +16,10 @@
 #          修复：start_service 内先检查是否已挂载，避免重复挂载和时序问题
 #   FIX-F: Docker tgz 仅校验大小，损坏文件永久阻塞
 #          修复：解压失败时删除对应 tgz 缓存，强制重新下载
-#   FIX-G: 自愈模式无冷却，失败 3 次配额被迅速耗尽
-#          修复：写入最后触发时间戳，两次自愈间隔 < 300s 时跳过
-#   FIX-H: agh-finalize 用 grep "users:" 检查向导完成，极脆弱（yaml schema 多变）
-#          修复：改为检查 AGH API /control/status 返回 JSON 中 running:true
+#   FIX-G: 自愈模式无冷却，date +%s fallback 用 awk srand() 返回随机值而非时间
+#          修复：fallback 改为读 /proc/uptime，冷却逻辑可靠
+#   FIX-H: agh-finalize 无认证访问 /control/status 必然 401，finalize 永远失败
+#          修复：agh-finalize 接收用户名密码参数，用 Basic Auth 验证登录
 #   FIX-I: swapon 后未设置 swappiness，USB 随机写慢导致系统假死
 #          修复：swapon 后立即设置 vm.swappiness=10 及其他内存参数
 #   FIX-J: run.sh 硬编码包管理器命令，无法兼容新旧版本
@@ -30,6 +31,14 @@
 #          修复：挂载前先检查 /proc/mounts，已挂载则跳过
 #   FIX-M: docker info + docker version 两次调用间 dockerd 可能退出
 #          修复：改用一次 docker info --format 同时获取状态和版本
+#   FIX-N: --force 不清理旧 AGH yaml，重跑时 AGH 读旧配置跳过向导
+#          修复：--force 时同时删除 /etc/adguardhome.yaml
+#   FIX-O: _DNSMASQ_BACKUP 路径名误导（dnsmasq.conf 暗示 /etc/dnsmasq.conf 格式）
+#          修复：改为 /etc/config/dhcp.agh-backup（备份的是 UCI dhcp 配置）
+#   FIX-P: dirty_ratio=5 过于激进，128MB 设备频繁小 IO 写 USB 反而降性能
+#          修复：dirty_ratio=20，dirty_background_ratio=10
+#   FIX-Q: 360v6-health 工具缺失，status 脚本提示但命令不存在
+#          新增：完整的健康检查 + --fix 自动修复工具
 
 _SD="/etc/install-state"
 mkdir -p "$_SD" /usr/lib/install-extras /usr/bin \
@@ -146,7 +155,127 @@ echo "AGH 管理: http://192.168.2.1:3000"
 echo "健康检查: 360v6-health [--fix]"
 echo "卸载    : 360v6-uninstall"
 STATUSEOF
+
 chmod +x /usr/bin/360v6-status
+
+# ══════════════════════════════════════════════════════════════
+# 模块 0b：360v6-health（V3.3）
+# ══════════════════════════════════════════════════════════════
+cat > /usr/bin/360v6-health << 'HEALTHEOF'
+#!/bin/sh
+# 健康检查工具，--fix 自动修复已知问题
+_SD="/etc/install-state"
+_fix=0
+[ "$1" = "--fix" ] && _fix=1
+
+_ok()   { echo "[OK]  $1"; }
+_warn() { echo "[WARN] $1"; }
+_err()  { echo "[ERR]  $1"; }
+_fix()  { [ "$_fix" -eq 1 ] && { echo "[FIX]  $1"; eval "$2"; } || echo "[HINT] 修复: $2"; }
+
+echo "=== 360 V6 健康检查 @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+[ "$_fix" -eq 1 ] && echo "（修复模式已启用）"
+echo ""
+
+_errs=0
+
+# 1. Flash 空间
+_flash_pct=$(df /overlay 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5);print $5}')
+if [ -n "$_flash_pct" ] && [ "$_flash_pct" -ge 90 ]; then
+    _err "Flash 使用率 ${_flash_pct}%（>= 90%），有写满风险"
+    _fix "清理 opkg/apk 缓存" "rm -rf /tmp/opkg-lists /var/cache/apk 2>/dev/null; opkg clean 2>/dev/null || true"
+    _errs=$((_errs+1))
+else
+    _ok "Flash 使用率 ${_flash_pct:-?}%"
+fi
+
+# 2. Swap
+if grep -q swapfile /proc/swaps 2>/dev/null; then
+    _ok "Swap 已激活"
+else
+    _warn "Swap 未激活"
+    _USB=""
+    for _m in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
+        grep -q "^[^ ]* $_m " /proc/mounts 2>/dev/null && { _USB="$_m"; break; }
+    done
+    [ -n "$_USB" ] && [ -f "$_USB/swapfile" ] &&         _fix "激活 swapfile" "swapon '$_USB/swapfile' 2>/dev/null && echo 10 > /proc/sys/vm/swappiness"
+fi
+
+# 3. Docker
+if [ -f "$_SD/docker-done" ]; then
+    _dver=$(docker info --format '{{.ServerVersion}}' 2>/dev/null)
+    if [ -n "$_dver" ]; then
+        _ok "Docker 运行中（$_dver）"
+    else
+        _err "Docker 已安装但未运行"
+        _fix "启动 dockerd" "/etc/init.d/dockerd start"
+        _errs=$((_errs+1))
+    fi
+else
+    _warn "Docker 未部署"
+fi
+
+# 4. AGH 进程
+if pgrep -f "AdGuardHome.*--config" >/dev/null 2>&1; then
+    _ok "AdGuardHome 进程运行中"
+else
+    if [ -f "$_SD/agh-done" ] || [ -f /etc/install-usb-done ]; then
+        _err "AdGuardHome 未运行"
+        _fix "启动 AGH" "/etc/init.d/adguardhome start"
+        _errs=$((_errs+1))
+    else
+        _warn "AdGuardHome 未部署"
+    fi
+fi
+
+# 5. DNS 冲突检测
+_dnsmasq_port=$(uci get dhcp.@dnsmasq[0].port 2>/dev/null)
+if [ -f "$_SD/agh-done" ]; then
+    # AGH 已 finalize，dnsmasq 应禁用
+    if [ "${_dnsmasq_port:-53}" != "0" ]; then
+        _err "DNS 冲突：AGH 已 finalize 但 dnsmasq 仍监听（port=${_dnsmasq_port:-53}）"
+        _fix "禁用 dnsmasq DNS 端口"             "uci set dhcp.@dnsmasq[0].port='0'; uci commit dhcp; /etc/init.d/dnsmasq reload"
+        _errs=$((_errs+1))
+    else
+        _ok "DNS 分配正常（dnsmasq DNS 已禁用，AGH 接管）"
+    fi
+else
+    _ok "DNS 分配正常（dnsmasq 提供 DNS，AGH 向导未完成）"
+fi
+
+# 6. AGH 端口 3000 可达性
+if pgrep -f "AdGuardHome.*--config" >/dev/null 2>&1; then
+    if command -v curl >/dev/null 2>&1; then
+        _hc=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://127.0.0.1:3000/ 2>/dev/null)
+        if [ "$_hc" = "200" ] || [ "$_hc" = "302" ] || [ "$_hc" = "301" ]; then
+            _ok "AGH Web 端口 3000 可达（HTTP $_hc）"
+        else
+            _warn "AGH Web 端口 3000 响应异常（HTTP $_hc）"
+        fi
+    fi
+fi
+
+# 7. U 盘挂载
+_USB=""
+for _m in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
+    grep -q "^[^ ]* $_m " /proc/mounts 2>/dev/null && { _USB="$_m"; break; }
+done
+if [ -n "$_USB" ]; then
+    _ok "U 盘挂载于 $_USB"
+    _usb_free=$(df -k "$_USB" 2>/dev/null | awk 'NR==2{print $4}')
+    [ "${_usb_free:-0}" -lt 524288 ] &&         _warn "U 盘剩余空间不足 512MB（${_usb_free}KB）"
+else
+    [ -f /etc/install-usb-done ] && _warn "U 盘未挂载，Docker/AGH 可能无法运行"
+fi
+
+echo ""
+if [ "$_errs" -eq 0 ]; then
+    echo "健康检查完成，无异常"
+else
+    echo "发现 ${_errs} 个问题$([ "$_fix" -eq 0 ] && echo '，运行 360v6-health --fix 自动修复' || echo '（已尝试修复）')"
+fi
+HEALTHEOF
+chmod +x /usr/bin/360v6-health
 
 # ══════════════════════════════════════════════════════════════
 # 模块 A：install-usb.sh（Phase 2 - V3.3）
@@ -158,7 +287,7 @@ _DONE="/etc/install-usb-done"
 _LOCK="/tmp/install-usb.lock"
 _SD="/etc/install-state"
 _MF="/etc/install-usb-mount"
-_DNSMASQ_BACKUP="/etc/dnsmasq.conf.agh-backup"
+_DNSMASQ_BACKUP="/etc/config/dhcp.agh-backup"
 
 _DOCKER_VERS="28.1.0 27.5.1 26.1.4"
 _DOCKER_BASE="https://download.docker.com/linux/static/stable/aarch64"
@@ -241,7 +370,7 @@ if [ "$__self_heal" -eq 1 ]; then
     [ -f "$_DONE" ] && exit 0
     # FIX-G: 冷却保护，两次自愈间隔 < 300s 则跳过
     __last_heal=$(cat "$_SD/last-self-heal" 2>/dev/null || echo 0)
-    __now=$(date '+%s' 2>/dev/null || awk 'BEGIN{srand();print srand()}')
+    __now=$(date '+%s' 2>/dev/null || awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
     __elapsed=$((__now - __last_heal))
     if [ "$__elapsed" -lt 300 ]; then
         log "自愈冷却中（距上次 ${__elapsed}s < 300s），跳过"
@@ -298,7 +427,9 @@ echo $$ > "$_LOCK"
 
 if [ "$__force" -eq 1 ]; then
     rm -f "$_SD/docker-failures" "$_SD/agh-failures" "$_SD/docker-done" "$_SD/agh-done"
-    log "--force：失败计数及组件标记已清零"
+    # 同时删除旧 AGH yaml：否则 AGH 会读取旧配置跳过向导，无法重新初始化
+    rm -f /etc/adguardhome.yaml
+    log "--force：失败计数、组件标记及 AGH 配置已清零"
 fi
 
 __docker_fail_count=$(cat "$_SD/docker-failures" 2>/dev/null || echo 0)
@@ -355,8 +486,8 @@ if ! grep -q swapfile /proc/swaps 2>/dev/null; then
         # FIX-I: 激活 swap 后立即调整内存参数，防止 USB 慢速 swap 导致假死
         echo 10   > /proc/sys/vm/swappiness          2>/dev/null
         echo 8192 > /proc/sys/vm/min_free_kbytes     2>/dev/null
-        echo 5    > /proc/sys/vm/dirty_ratio         2>/dev/null
-        echo 3    > /proc/sys/vm/dirty_background_ratio 2>/dev/null
+        echo 20   > /proc/sys/vm/dirty_ratio         2>/dev/null
+        echo 10   > /proc/sys/vm/dirty_background_ratio 2>/dev/null
         log "内存参数已优化（swappiness=10）"
     fi
 fi
@@ -534,6 +665,14 @@ START=98; STOP=10; USE_PROCD=1
 start_service() {
     _mp=$(cat /etc/install-usb-mount 2>/dev/null)
     [ -f "$_mp/adguardhome-bin/AdGuardHome" ] || return 1
+    # 向导已完成（agh-done 存在）时，必须先释放 53 端口再启动 AGH
+    # 否则 AGH 绑定 53 失败后立即退出，procd respawn 无限循环
+    if [ -f /etc/install-state/agh-done ]; then
+        uci set dhcp.@dnsmasq[0].port='0' 2>/dev/null
+        uci commit dhcp 2>/dev/null
+        /etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
+        logger -t "adguardhome" "dnsmasq DNS 端口已释放，AGH 准备接管"
+    fi
     procd_open_instance
     procd_set_param command "$_mp/adguardhome-bin/AdGuardHome" \
         --config /etc/adguardhome.yaml \
@@ -541,17 +680,6 @@ start_service() {
         --no-check-update
     procd_set_param stdout 1; procd_set_param stderr 1; procd_set_param respawn 3600 5 0
     procd_close_instance
-    # FIX-B: procd_close_instance 之后才能做其他操作
-    # FIX: 仅在 agh-done 存在时（向导已完成）才禁用 dnsmasq，用后台子进程延迟执行
-    if [ -f /etc/install-state/agh-done ]; then
-        (
-            sleep 5
-            uci set dhcp.@dnsmasq[0].port='0' 2>/dev/null
-            uci commit dhcp 2>/dev/null
-            /etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
-            logger -t "adguardhome" "dnsmasq DNS 端口已禁用（AGH 接管）"
-        ) &
-    fi
 }
 
 stop_service() {
@@ -578,38 +706,60 @@ AINITEOF
             log "    向导完成后执行: agh-finalize  （完成 DNS 接管）"
 
             # FIX-H: agh-finalize 改用 API 检测向导完成，不依赖 yaml 内容格式
+            # agh-finalize：向导完成后由用户手动执行一次，需传入管理员凭据
             cat > /usr/bin/agh-finalize << 'FINALEOF'
 #!/bin/sh
 # 在 AGH 初始化向导完成后执行此命令，完成 DNS 接管和状态标记
+# 用法：agh-finalize <用户名> <密码>
 _SD="/etc/install-state"
-_DNSMASQ_BACKUP="/etc/dnsmasq.conf.agh-backup"
+_DNSMASQ_BACKUP="/etc/config/dhcp.agh-backup"
 
-# FIX-H: 用 API 检测 AGH 是否就绪且向导已完成
-# /control/status 在向导未完成时返回 401 或重定向到向导页，完成后返回 200 + JSON
-if ! command -v curl >/dev/null 2>&1; then
-    echo "[ERR] 需要 curl，请先安装: opkg install curl"
+_user="${1:-}"
+_pass="${2:-}"
+
+if [ -z "$_user" ] || [ -z "$_pass" ]; then
+    echo "用法: agh-finalize <用户名> <密码>"
+    echo "      用户名和密码为 AGH 向导中设置的管理员账户"
     exit 1
 fi
 
-echo "[..] 检测 AGH 状态..."
-_http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+if ! command -v curl >/dev/null 2>&1; then
+    echo "[ERR] 需要 curl"
+    exit 1
+fi
+
+if ! pgrep -f "AdGuardHome.*--config" >/dev/null 2>&1; then
+    echo "[ERR] AGH 进程未运行"
+    exit 1
+fi
+
+echo "[..] 验证 AGH 登录凭据..."
+# 向导完成后 /control/status 需要 Basic Auth
+# -L 跟随重定向：向导未完成时会 302 到 /install.html
+_http_code=$(curl -s -o /tmp/agh-resp.tmp -w "%{http_code}" \
+    --max-time 5 -L \
+    -u "${_user}:${_pass}" \
     http://127.0.0.1:3000/control/status 2>/dev/null)
 
+# 被重定向到向导页（响应体含 install）
+if grep -qi "install" /tmp/agh-resp.tmp 2>/dev/null; then
+    rm -f /tmp/agh-resp.tmp
+    echo "[ERR] AGH 向导尚未完成，请先访问 http://192.168.2.1:3000 完成初始化"
+    exit 1
+fi
+rm -f /tmp/agh-resp.tmp
+
+if [ "$_http_code" = "401" ] || [ "$_http_code" = "403" ]; then
+    echo "[ERR] 用户名或密码错误（HTTP $_http_code）"
+    exit 1
+fi
+
 if [ "$_http_code" != "200" ]; then
-    echo "[ERR] AGH 未响应或向导未完成（HTTP $_http_code）"
-    echo "      请先访问 http://192.168.2.1:3000 完成初始化向导"
+    echo "[ERR] AGH 响应异常（HTTP $_http_code）"
     exit 1
 fi
 
-# 进一步确认：/control/status 返回的 JSON 中 running 字段为 true
-_status=$(curl -s --max-time 5 http://127.0.0.1:3000/control/status 2>/dev/null)
-if ! echo "$_status" | grep -q '"running":true'; then
-    echo "[ERR] AGH 返回状态异常，请确认向导已完成并保存"
-    echo "      响应: $_status"
-    exit 1
-fi
-
-echo "[OK] AGH 向导已完成，开始接管 DNS..."
+echo "[OK] AGH 登录验证成功，开始接管 DNS..."
 
 # 禁用 dnsmasq DNS 端口
 uci set dhcp.@dnsmasq[0].port='0' 2>/dev/null
