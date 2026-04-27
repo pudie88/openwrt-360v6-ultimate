@@ -1,7 +1,7 @@
-# 🚀 360 V6 一键扩展脚本 
+# 🚀 360 V6 一键扩展脚本 V3.5 STABLE
 
 > 专为 **360 V6 / 小米 CR660x / IPQ6000** 设计。  
-> **128M Flash + 512M RAM**，无 U 盘 = HomeProxy 代理基础版，插 U 盘 = 全自动扩展部署。
+> **128M Flash + 512M RAM**，无 U 盘 = 基础版（包管理器工具），插 U 盘 = 全自动 Docker + AdGuardHome 部署。
 
 ---
 
@@ -9,33 +9,35 @@
 
 | 类别 | 说明 |
 |------|------|
-| 🟦 **固件预编译** | ImmortalWrt 原生功能已内置：网络管理 / LuCI 界面 / SmartDNS / HomeProxy / 基础 Samba / 状态监控 / 系统设置等，**无 U 盘即享 HomeProxy 代理基础版** |
-| 🟩 **本脚本扩展** | 插上 U 盘后自动触发：Docker / AGH 完整安装、`/tmp` 缓存重定向、自愈巡逻、Flash 智能保护、健康检查与卸载工具 |
+| 🟦 **固件预编译** | ImmortalWrt 原生功能：网络管理 / LuCI 界面 / SmartDNS / HomeProxy / 基础 Samba / 状态监控 / 系统设置等 |
+| 🟩 **本脚本扩展** | 插 U 盘后自动触发：Docker / AdGuardHome 完整安装、Swap 自动配置、健康检查与卸载工具 |
+
+> ⚠️ **无 U 盘时**：脚本仅安装基础工具包（bash/htop/lsblk/smartmontools/fdisk/curl），不部署 Docker/AGH
 
 ---
 
 ## ✨ 核心特性
 
 - **🛡️ Flash 零占用**：Docker / AGH 二进制全装 U 盘，系统仅存符号链接 (~5MB)
-- **🔧 `/tmp` 爆满根治**：apk 缓存与临时目录自动重定向至 U 盘，大包安装不失败
-- **🤖 全自动运维**：WAN / U 盘热插拔触发 + 5分钟自愈巡逻 + `360v6-health --fix` 一键修复
-- **⚡ 智能保护**：Flash <20MB 中止 / <25MB 跳过 Samba 及 LuCI 插件，永不写爆
-- **📦 运维工具集**：状态查询、健康检查、完整卸载，告别盲猜
+- **🤖 全自动运维**：WAN / U 盘热插拔触发 + 健康检查自动修复 (`--fix`)
+- **⚡ 智能容错**：组件失败计数（最多 3 次） + 完整性校验（gzip -t）+ 下载重试（3 次）
+- **📦 运维工具集**：`360v6-status` / `360v6-health` / `360v6-uninstall` / `agh-finalize`
+- **🔐 密码安全**：`agh-finalize` 支持交互式密码输入（stty -echo），避免明文暴露进程列表
 
 ---
 
 ## 🚀 快速开始
 
-### 方案一：无 U 盘 - HomeProxy 基础版
-- 直接刷入固件，无需任何操作
-- 即享 HomeProxy 代理、SmartDNS、基础 Samba 等内置功能
+### 方案一：无 U 盘 - 基础版
+1. 刷入固件（已预置本脚本）
+2. 连接 WAN 口，首次联网自动触发基础部署
+3. 安装基础工具：`bash` `htop` `lsblk` `smartmontools` `fdisk` `curl`
 
 ### 方案二：插 U 盘 - 全自动扩展部署
-1. **准备 U 盘**：≥2GB，格式 ext4（Docker 要求）或 FAT32/NTFS
+1. **准备 U 盘**：≥2GB，**推荐 ext4 格式**（Docker overlay2 需要）
 2. **插入 U 盘**：插入路由器 USB 口
-3. **刷入固件并重启**：固件已包含本脚本，重启后自动部署
-4. **等待部署**：WAN 上线后自动运行，全程约 **5-12 分钟**
-5. **验证状态**：`360v6-status`
+3. **连接 WAN**：脚本自动触发，全程约 **5-12 分钟**
+4. **验证状态**：`360v6-status`
 
 ### 方案三：手动部署（已有固件）
 ```bash
@@ -55,15 +57,22 @@ sh /etc/uci-defaults/96-install-extras
 ## 📁 目录结构
 
 ```
-U 盘 (/mnt/sda1/)                    │ 系统 (/)
-├── .downloads/                      │ ├── /etc/install-{extras,usb}-done  # 完成标记
-│   ├── docker-28.1.0.tgz           │ ├── /etc/install-state/             # 失败计数
-│   └── AdGuardHome_linux_arm64.tar.gz│ └── /usr/bin/                      # 运维工具
-├── docker-bin/                      │     ├── 360v6-status
-├── docker-data/                     │     ├── 360v6-health
-├── adguardhome-bin/                 │     └── 360v6-uninstall
-├── AdGuardHome/{config,data}/       │
-└── swapfile                         │
+U 盘 (/mnt/sda1/)                      │ 系统 (/)
+├── .downloads/                        │ ├── /etc/install-{extras,usb}-done   # 完成标记
+│   ├── docker-28.1.0.tgz             │ ├── /etc/install-state/              # 失败计数/自愈状态
+│   └── AdGuardHome_linux_arm64.tar.gz│ │   ├── docker-failures
+├── docker-bin/                        │ │   ├── agh-failures
+│   ├── docker                         │ │   ├── phase1-failures
+│   ├── dockerd                        │ │   ├── docker-done
+│   └── ...                            │ │   └── agh-done
+├── docker-data/                       │ ├── /usr/bin/
+├── adguardhome-bin/                   │ │   ├── 360v6-status
+│   └── AdGuardHome                    │ │   ├── 360v6-health
+├── AdGuardHome/                       │ │   ├── 360v6-uninstall
+│   └── data/                          │ │   └── agh-finalize
+│       └── {config,logs,...}          │ ├── /etc/init.d/dockerd
+└── swapfile (256MB)                   │ └── /etc/hotplug.d/{iface,block}/
+                                        └── 96-install-extras  # hotplug 触发器
 ```
 
 ---
@@ -75,10 +84,11 @@ U 盘 (/mnt/sda1/)                    │ 系统 (/)
 | 查看状态/版本/完成时间 | `360v6-status` |
 | 健康检查 | `360v6-health` |
 | 健康检查并自动修复 | `360v6-health --fix` |
-| 实时日志 | `logread -f \| grep -E "install-main\|usb-extras\|hotplug"` |
+| 实时日志 | `logread -f \| grep -E "install-main\|usb-extras"` |
 | 完全卸载 | `360v6-uninstall` |
 | 手动重跑基础环境 | `rm -f /etc/install-extras-done /etc/install-state/phase1-failures && /usr/lib/install-extras/run.sh` |
 | 手动重跑重型应用 | `rm -f /etc/install-usb-done && /usr/lib/install-extras/install-usb.sh --force` |
+| AGH 配置完成后接管 DNS | `agh-finalize <用户名>` （密码交互式输入） |
 
 ---
 
@@ -87,42 +97,80 @@ U 盘 (/mnt/sda1/)                    │ 系统 (/)
 | 服务 | 地址 | 默认凭据 | 说明 |
 |------|------|----------|------|
 | LuCI 管理 | `http://192.168.2.1` | root / (空) | 固件内置系统管理界面 |
-| HomeProxy | Luci 内配置 | - | 代理基础版，无需 U 盘 |
-| AdGuardHome | `http://192.168.2.1:3000` | 首次访问需配置 | 需插 U 盘；无配置时自动进入 setup 模式，配置完成后自动接管 DNS |
-| Samba 共享 | `\\192.168.2.1` | root / (空) | Flash ≥25MB 时自动安装 |
+| HomeProxy | LuCI 内配置 | - | 代理基础版，无需 U 盘 |
+| AdGuardHome | `http://192.168.2.1:3000` | 首次访问需配置 | 需插 U 盘；向导完成后执行 `agh-finalize` 接管 DNS |
 | Docker CLI | SSH 登录后执行 | `docker ps` | 需要先部署 U 盘 |
 
 ---
 
 ## 🔧 部署策略
 
-### Flash 分级保护
-
-| Flash 剩余 | 行为 |
-|-----------|------|
-| < 20MB | ❌ 中止安装，防止变砖 |
-| 20-25MB | ✅ 安装基础工具，跳过 Samba 及所有 LuCI 界面包 |
-| ≥ 25MB | ✅ 安装基础工具 + Samba4，Flash 充足时附加 LuCI 界面包 |
+### U 盘空间要求
+- **最小要求**：≥1GB 可用空间（脚本启动时检查）
+- **推荐格式**：ext4（Docker overlay2 驱动需要 overlay 文件系统支持）
 
 ### Docker 版本自动探测
 
 支持版本（按优先级）：
 ```
-28.1.0 → 28.0.4 → 27.5.1 → 26.1.4 → 25.0.5 → 24.0.7
+28.1.0 → 27.5.1 → 26.1.4
 ```
 
-自动测试可用性，优先使用最新稳定版。
+自动测试可用性，优先使用最新稳定版，下载失败时自动降级。
+
+### 完整性保护机制
+
+| 机制 | 说明 |
+|------|------|
+| **gzip -t 校验** | 下载完成后校验 tgz 完整性，拦截截断文件/错误页面 |
+| **下载重试** | 最多重试 3 次，每次间隔 3 秒，最小文件大小检查 |
+| **空目录检测** | tar 解压后检查是否有文件被移动，防止静默失败 |
+| **失败计数** | 组件失败 ≥3 次后自动跳过，避免无限重试 |
+
+### DNS 冲突检测（V3.5 改进）
+
+基于 `netstat` 直接检测 dnsmasq 实际端口占用：
+```bash
+netstat -lnup | awk '$4 ~ /:53$/ && $NF ~ /dnsmasq/'
+```
+避免 UCI 配置未设置 port 时误报冲突。
+
+### AGH 密码安全（V3.5 新增）
+
+```bash
+# 推荐方式：交互式输入（密码不回显）
+agh-finalize admin
+
+# 不推荐：明文传参（会出现在进程列表）
+agh-finalize admin mypassword
+```
+
+---
+
+## 🔄 自愈机制
+
+### 触发条件
+- U 盘已插入但重型应用未完成（`/etc/install-usb-done` 不存在）
+- 距上次自愈 ≥300 秒
+- 组件失败次数未达上限（docker-failures <3 且 agh-failures <3）
+
+### 执行逻辑
+- 检测 U 盘挂载点
+- 清理残留锁文件
+- 重新执行 `/usr/lib/install-extras/install-usb.sh`
+
+> 自愈由 crontab 或外部触发器调用：`/usr/lib/install-extras/install-usb.sh --self-heal`
 
 ---
 
 ## ⚠️ 注意事项 & 快速排查
 
 ### 重要提醒
-- **无 U 盘 = HomeProxy 基础版**：固件内置功能开箱即用
+- **无 U 盘 = 基础工具包**：仅安装 bash/htop/lsblk/smartmontools/fdisk/curl
 - **插 U 盘 = 全自动扩展**：断电/拔盘可能导致锁残留
 - **日志输出**：脚本使用 `logger`，终端无回显属正常
-- **Swap 自动挂载**：已写入 `/etc/fstab`，重启无需手动 `swapon`
-- **Docker 需要 ext4**：overlay2 驱动要求 U 盘格式为 ext4/f2fs
+- **Swap**：首次插 U 盘时自动创建 256MB swapfile 并激活（重启后需重新激活）
+- **Docker 需要 overlay 支持**：U 盘格式建议 ext4，否则降级为 vfs 驱动
 
 ### 常见问题
 
@@ -130,9 +178,11 @@ U 盘 (/mnt/sda1/)                    │ 系统 (/)
 |------|------|
 | 服务未启动 | 运行 `360v6-health --fix` 自动修复 |
 | 安装卡住 | `rm -f /tmp/install-*.lock` 清理残留锁后重试 |
-| Flash 告急 | `apk cache clean` 清理缓存，脚本会自动降级 |
-| AGH 无法访问 | `iptables -I INPUT -p tcp --dport 3000 -j ACCEPT` |
-| Docker 启动失败 | 检查 U 盘格式：`mount \| grep sda`，应为 ext4 |
+| Flash 告急 | `apk cache clean` 清理缓存 |
+| AGH 无法访问向导 | 检查防火墙：`iptables -I INPUT -p tcp --dport 3000 -j ACCEPT` |
+| Docker 启动失败 | 检查 U 盘格式：`mount \| grep sda`，建议 ext4 |
+| AGH 密码明文暴露 | 使用 `agh-finalize <用户名>`（省略密码参数）交互式输入 |
+| DNS 冲突（53 端口占用）| 运行 `360v6-health --fix` 自动禁用 dnsmasq 端口 |
 
 ---
 
@@ -143,16 +193,20 @@ U 盘 (/mnt/sda1/)                    │ 系统 (/)
 360v6-uninstall
 
 # 按提示确认后自动清理：
-# - 停止并禁用服务
-# - 恢复 dnsmasq DNS（端口 53）
-# - 删除 init.d 脚本、symlink、配置文件
-# - 删除状态文件、hotplug、cron 条目
-# - 删除运维工具
-# - 可选清理 U 盘下载缓存
+# - 停止并禁用 dockerd / AdGuardHome
+# - 恢复 dnsmasq DNS 端口（删除 port=0 配置）
+# - 删除 /usr/bin 下的 symlink
+# - 删除 /etc/init.d/dockerd
+# - 删除状态文件（/etc/install-*-done、/etc/install-state/*）
+# - 删除 hotplug 脚本
+# - 删除 agh-finalize、360v6-* 工具
 ```
 
-> 📌 U 盘上的 `docker-data/` 和 `AdGuardHome/` 数据**默认保留**，卸载时可选清理。
+> 📌 **数据保留**：U 盘上的 `docker-data/`、`AdGuardHome/`、`swapfile` 及 `.downloads/` **默认保留**，如需清理请手动删除。
 
 
-> **一句话总结：无 U 盘即享 HomeProxy 代理基础版，插上 U 盘 → 连接 WAN → 去睡觉。**  
-> 醒来即享 Docker + 去广告 + 文件共享，运维零干预。🎉
+
+> **一句话总结：插 U 盘 → 连 WAN → 等 10 分钟 → 访问 3000 端口配 AGH → 执行 agh-finalize → 享受去广告 + Docker。**  
+> 运维工具全配齐，健康检查一键修，卸载不残留。🎉
+```
+
