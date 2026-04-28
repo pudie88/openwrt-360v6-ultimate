@@ -1,4 +1,4 @@
-# 🚀 360 V6 一键扩展脚本
+# 🚀 openwrt-360v6＋ 一键扩展脚本
 > 专为 **360 V6 / 小米 CR660x / IPQ6000** 设计。  
 > **128M Flash + 512M RAM**，无 U 盘 = 基础版（包管理器工具），插 U 盘 = 全自动 Docker + AdGuardHome 部署。
 
