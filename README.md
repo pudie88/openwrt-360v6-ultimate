@@ -9,7 +9,7 @@
 | 类别 | 说明 |
 |------|------|
 | 🟦 **固件预编译** | ImmortalWrt 原生功能：网络管理 / LuCI 界面 / SmartDNS / HomeProxy / 基础 Samba / 状态监控 / 系统设置等 |
-| 🟩 **本脚本扩展** | 插 U 盘后自动触发：Docker / AdGuardHome 完整安装、Swap 自动配置、健康检查与卸载工具 |
+| 🟩 **脚本扩展** | 插 U 盘后自动触发：Docker / AdGuardHome 完整安装、Swap 自动配置、健康检查与卸载工具 |
 
 > ⚠️ **无 U 盘时**：脚本仅安装基础工具包（bash/htop/lsblk/smartmontools/fdisk/curl），不部署 Docker/AGH
 
