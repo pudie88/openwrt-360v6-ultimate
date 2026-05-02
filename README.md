@@ -1,6 +1,5 @@
-# 🚀 openwrt-360v6-plus 一键扩展脚本 [V1.2]
-
-> 专为 **360 V6 / 小米 CR660x / IPQ6000** 设计。  
+# 🚀 openwrt-360v6-plus 
+96-install-extras为一键扩展脚本 。  
 > **128M Flash + 512M RAM**，无 U 盘 = 基础版（包管理器工具），插 U 盘 = 全自动 Docker + AdGuardHome 部署。
 
 ---
@@ -16,7 +15,7 @@
 
 ---
 
-## ✨ 核心特性 [V1.2]
+## ✨ 核心特性 
 
 - **🛡️ Flash 零占用**：Docker / AGH 二进制全装 U 盘，系统仅存符号链接 (~5MB)
 - **🤖 全自动运维**：WAN / U 盘热插拔触发 + 健康检查自动修复 (`--fix`)
@@ -57,28 +56,7 @@ sh /etc/uci-defaults/96-install-extras
 360v6-status
 ```
 
----
 
-## 📁 目录结构
-
-```
-U 盘 (/mnt/sda1/)                      │ 系统 (/)
-├── .downloads/                        │ ├── /etc/install-{extras,usb}-done   # 完成标记
-│   ├── docker-28.1.0.tgz             │ ├── /etc/install-state/              # 失败计数/自愈状态
-│   └── AdGuardHome_linux_arm64.tar.gz│ │   ├── docker-failures
-├── docker-bin/                        │ │   ├── agh-failures
-│   ├── docker                         │ │   ├── phase1-failures
-│   ├── dockerd                        │ │   ├── docker-done
-│   └── ...                            │ │   └── agh-done
-├── docker-data/                       │ ├── /usr/bin/
-├── adguardhome-bin/                   │ │   ├── 360v6-status
-│   └── AdGuardHome                    │ │   ├── 360v6-health
-├── AdGuardHome/                       │ │   ├── 360v6-uninstall
-│   └── data/                          │ │   └── agh-finalize
-│       └── {config,logs,...}          │ ├── /etc/init.d/dockerd
-└── swapfile (256MB)                   │ └── /etc/hotplug.d/{iface,block}/
-                                        └── 96-install-extras  # hotplug 触发器
-```
 
 ---
 
