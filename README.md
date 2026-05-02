@@ -1,4 +1,5 @@
-# 🚀 openwrt-360v6＋ 一键扩展脚本
+# 🚀 openwrt-360v6-plus 一键扩展脚本 [V1.2]
+
 > 专为 **360 V6 / 小米 CR660x / IPQ6000** 设计。  
 > **128M Flash + 512M RAM**，无 U 盘 = 基础版（包管理器工具），插 U 盘 = 全自动 Docker + AdGuardHome 部署。
 
@@ -15,11 +16,16 @@
 
 ---
 
-## ✨ 核心特性
+## ✨ 核心特性 [V1.2]
 
 - **🛡️ Flash 零占用**：Docker / AGH 二进制全装 U 盘，系统仅存符号链接 (~5MB)
 - **🤖 全自动运维**：WAN / U 盘热插拔触发 + 健康检查自动修复 (`--fix`)
-- **⚡ 智能容错**：组件失败计数（最多 3 次） + 完整性校验（gzip -t）+ 下载重试（3 次）
+- **⚡ 智能容错增强**：
+  - `_wget_retry` 支持**断点续传** + **5 次重试** + **指数退避间隔**
+  - `_download_agh` 多源轮询（ghfast/ghproxy/直连），**支持跨源续传**
+  - 组件失败计数（最多 3 次）+ 完整性校验（gzip -t）
+- **💾 Swap 坏块检测**：激活后执行写入验证，检测坏块自动禁用并重建
+- **🐳 Docker 就绪检测**：循环等待最多 20s，消除"初始化中"误报
 - **📦 运维工具集**：`360v6-status` / `360v6-health` / `360v6-uninstall` / `agh-finalize`
 - **🔐 密码安全**：`agh-finalize` 支持交互式密码输入（stty -echo），避免明文暴露进程列表
 
@@ -83,7 +89,7 @@ U 盘 (/mnt/sda1/)                      │ 系统 (/)
 | 查看状态/版本/完成时间 | `360v6-status` |
 | 健康检查 | `360v6-health` |
 | 健康检查并自动修复 | `360v6-health --fix` |
-| 实时日志 | `logread -f \| grep -E "install-main\|usb-extras"` |
+| 实时日志 | `logread -f \| grep -E "install-main\|usb-extras\|agh-finalize"` |
 | 完全卸载 | `360v6-uninstall` |
 | 手动重跑基础环境 | `rm -f /etc/install-extras-done /etc/install-state/phase1-failures && /usr/lib/install-extras/run.sh` |
 | 手动重跑重型应用 | `rm -f /etc/install-usb-done && /usr/lib/install-extras/install-usb.sh --force` |
@@ -122,7 +128,9 @@ U 盘 (/mnt/sda1/)                      │ 系统 (/)
 | 机制 | 说明 |
 |------|------|
 | **gzip -t 校验** | 下载完成后校验 tgz 完整性，拦截截断文件/错误页面 |
-| **下载重试** | 最多重试 3 次，每次间隔 3 秒，最小文件大小检查 |
+| **断点续传** | 已下载 >1MB 时自动续传，节省流量 + 提高成功率 |
+| **多源轮询** | ghfast.top → ghproxy → GitHub 直连，自动切换可用源 |
+| **跨源续传** | 换源时保留已有数据，支持从不同源继续下载 |
 | **空目录检测** | tar 解压后检查是否有文件被移动，防止静默失败 |
 | **失败计数** | 组件失败 ≥3 次后自动跳过，避免无限重试 |
 
@@ -168,7 +176,7 @@ agh-finalize admin mypassword
 - **无 U 盘 = 基础工具包**：仅安装 bash/htop/lsblk/smartmontools/fdisk/curl
 - **插 U 盘 = 全自动扩展**：断电/拔盘可能导致锁残留
 - **日志输出**：脚本使用 `logger`，终端无回显属正常
-- **Swap**：首次插 U 盘时自动创建 256MB swapfile 并激活（重启后需重新激活）
+- **Swap**：首次插 U 盘时自动创建 256MB swapfile 并激活（重启后需重新激活），**V1.2 新增坏块检测**
 - **Docker 需要 overlay 支持**：U 盘格式建议 ext4，否则降级为 vfs 驱动
 
 ### 常见问题
@@ -182,6 +190,7 @@ agh-finalize admin mypassword
 | Docker 启动失败 | 检查 U 盘格式：`mount \| grep sda`，建议 ext4 |
 | AGH 密码明文暴露 | 使用 `agh-finalize <用户名>`（省略密码参数）交互式输入 |
 | DNS 冲突（53 端口占用）| 运行 `360v6-health --fix` 自动禁用 dnsmasq 端口 |
+| AGH 下载失败 | 检查网络，脚本会自动轮询多源；仍失败可手动执行 `360v6-upgrade --agh` |
 
 ---
 
@@ -207,5 +216,3 @@ agh-finalize admin mypassword
 
 > **一句话总结：插 U 盘 → 连 WAN → 等 10 分钟 → 访问 3000 端口配 AGH → 执行 agh-finalize → 享受去广告 + Docker。**  
 > 运维工具全配齐，健康检查一键修，卸载不残留。🎉
-```
-
